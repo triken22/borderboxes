@@ -6,9 +6,35 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass';
 import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader';
-import va from '@vercel/analytics';
 
 let ws: WebSocket;
+
+const analyticsEndpoint = import.meta.env.DEV
+  ? 'http://localhost:8787/analytics'
+  : '/analytics';
+
+function trackEvent(event: string, payload: Record<string, unknown> = {}) {
+  const body = JSON.stringify({
+    event,
+    playerId: typeof pid === 'string' ? pid : undefined,
+    timestamp: Date.now(),
+    ...payload
+  });
+
+  if (navigator.sendBeacon) {
+    const success = navigator.sendBeacon(analyticsEndpoint, body);
+    if (success) return;
+  }
+
+  fetch(analyticsEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    keepalive: true
+  }).catch(() => {
+    // Swallow analytics errors; gameplay must continue
+  });
+}
 
 // Difficulty selection
 type Difficulty = 'easy' | 'normal' | 'hard';
@@ -40,7 +66,7 @@ difficultyButtons.forEach(btn => {
     ev.stopPropagation();
     const level = btn.dataset.difficulty as Difficulty | undefined;
     if (level) {
-      va.track('difficulty_selected', { level });
+      trackEvent('difficulty_selected', { level });
       sendDifficulty(level);
     }
   });
@@ -1193,7 +1219,7 @@ function connect() {
     const msg = JSON.parse(ev.data);
 
     if (msg.type === 'hello') {
-      va.track('session_start', { difficulty: msg.difficulty ?? currentDifficulty });
+      trackEvent('session_start', { difficulty: msg.difficulty ?? currentDifficulty });
       pid = msg.id;
       myPlayer = msg.player;
 
@@ -1352,11 +1378,11 @@ function connect() {
     if (msg.type === 'event') {
       if (msg.event === 'difficulty' && typeof msg.difficulty === 'string') {
         updateDifficultyUI(msg.difficulty as Difficulty);
-        va.track('difficulty_updated', { level: msg.difficulty });
+        trackEvent('difficulty_updated', { level: msg.difficulty });
       }
 
       if (msg.event === 'kill') {
-        va.track('kill', { playerId: msg.playerId, mobId: msg.mobId, isLocal: msg.playerId === pid });
+        trackEvent('kill', { playerId: msg.playerId, mobId: msg.mobId, isLocal: msg.playerId === pid });
         if (msg.playerId === pid) {
           kills++;
           document.getElementById('kills')!.textContent = kills.toString();
@@ -1364,7 +1390,7 @@ function connect() {
       }
 
       if (msg.event === 'pickup') {
-        va.track('loot_pickup', { playerId: msg.playerId, rarity: msg.item?.rarity });
+        trackEvent('loot_pickup', { playerId: msg.playerId, rarity: msg.item?.rarity });
         if (msg.playerId === pid) {
           inventory.push(msg.item);
           updateInventoryUI();
@@ -1393,7 +1419,7 @@ function connect() {
       }
 
       if (msg.event === 'damage' && msg.targetId === pid) {
-        va.track('damage_taken', { amount: msg.damage, sourceId: msg.sourceId });
+        trackEvent('damage_taken', { amount: msg.damage, sourceId: msg.sourceId });
         // Screen shake effect when player takes damage
         const shakeIntensity = Math.min(msg.damage * 0.002, 0.1);
         const shakeDuration = 200;
@@ -1468,7 +1494,7 @@ function connect() {
       }
 
       if (msg.event === 'equip' && msg.item) {
-        va.track('weapon_equip', { playerId: msg.playerId, rarity: msg.item.rarity, archetype: msg.item.archetype });
+        trackEvent('weapon_equip', { playerId: msg.playerId, rarity: msg.item.rarity, archetype: msg.item.archetype });
         if (msg.playerId === pid) {
           myPlayer = myPlayer ? { ...myPlayer, equipped: msg.item } : myPlayer;
           applyWeaponCosmetics(msg.item);
@@ -1614,7 +1640,7 @@ document.addEventListener('keydown', (e) => {
     for (const [id, mesh] of lootDrops.entries()) {
       const dist = mesh.position.distanceTo(me.position);
       if (dist < 3) {
-        va.track('loot_pickup_attempt', { lootId: id });
+        trackEvent('loot_pickup_attempt', { lootId: id });
         ws?.send(JSON.stringify({ type: 'pickup', lootId: id }));
         break;
       }

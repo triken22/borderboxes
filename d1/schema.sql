@@ -33,3 +33,11 @@ CREATE TABLE IF NOT EXISTS items (
   reload_ms INTEGER,
   seed TEXT           -- for deterministic reroll/replication
 );
+
+CREATE TABLE IF NOT EXISTS analytics_events (
+  id TEXT PRIMARY KEY,
+  event TEXT NOT NULL,
+  player_id TEXT,
+  payload TEXT,
+  created_at INTEGER DEFAULT (strftime('%s','now'))
+);
