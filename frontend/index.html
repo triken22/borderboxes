@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Borderboxes</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        overflow: hidden;
+        background: #1a1a1a;
+      }
+      #c {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+      #ui {
+        position: fixed;
+        top: 20px;
+        left: 20px;
+        color: white;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+        font-size: 16px;
+        font-weight: bold;
+        pointer-events: none;
+        user-select: none;
+        z-index: 10;
+      }
+      .health-bar {
+        width: 200px;
+        height: 24px;
+        background: rgba(0,0,0,0.5);
+        border: 2px solid #333;
+        margin-top: 10px;
+        position: relative;
+      }
+      .health-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #ff3333, #ff6666);
+        transition: width 0.3s ease;
+      }
+      .stamina-bar {
+        width: 200px;
+        height: 16px;
+        background: rgba(0,0,0,0.5);
+        border: 2px solid #333;
+        margin-top: 5px;
+        position: relative;
+      }
+      .stamina-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #3366ff, #66aaff);
+        transition: width 0.1s ease;
+      }
+      .movement-state {
+        position: fixed;
+        bottom: 100px;
+        left: 20px;
+        color: white;
+        font-size: 14px;
+        font-weight: bold;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+        pointer-events: none;
+      }
+      .death-screen {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.8);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        color: white;
+        z-index: 1000;
+      }
+      .death-screen.active {
+        display: flex;
+      }
+      .death-title {
+        font-size: 48px;
+        font-weight: bold;
+        color: #ff3333;
+        margin-bottom: 20px;
+      }
+      .respawn-timer {
+        font-size: 24px;
+        margin-bottom: 10px;
+      }
+      .death-stats {
+        font-size: 18px;
+        opacity: 0.8;
+      }
+      .inventory {
+        position: fixed;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        gap: 10px;
+      }
+      .slot {
+        width: 60px;
+        height: 60px;
+        background: rgba(0,0,0,0.6);
+        border: 2px solid #444;
+        border-radius: 4px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-size: 12px;
+        font-weight: bold;
+      }
+      .slot.equipped {
+        border-color: #ffa500;
+        box-shadow: 0 0 10px rgba(255,165,0,0.5);
+      }
+      .slot.common { border-color: #888; }
+      .slot.rare { border-color: #4169e1; }
+      .slot.epic { border-color: #9932cc; }
+      .slot.legendary { border-color: #ff8c00; }
+      .crosshair {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 20px;
+        height: 20px;
+        pointer-events: none;
+        z-index: 100;
+      }
+      .crosshair::before,
+      .crosshair::after {
+        content: '';
+        position: absolute;
+        background: white;
+        box-shadow: 0 0 3px rgba(0,0,0,0.8);
+      }
+      .crosshair::before {
+        top: 50%;
+        left: 0;
+        right: 0;
+        height: 2px;
+        transform: translateY(-50%);
+      }
+      .crosshair::after {
+        left: 50%;
+        top: 0;
+        bottom: 0;
+        width: 2px;
+        transform: translateX(-50%);
+      }
+      .instructions {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        color: white;
+        background: rgba(0,0,0,0.6);
+        padding: 15px;
+        border-radius: 4px;
+        font-size: 14px;
+        max-width: 200px;
+      }
+      .difficulty-panel {
+        position: fixed;
+        top: 20px;
+        right: 240px;
+        background: rgba(0, 0, 0, 0.65);
+        padding: 12px 16px;
+        border-radius: 6px;
+        color: white;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        pointer-events: auto;
+        z-index: 20;
+        width: 160px;
+      }
+      .difficulty-panel h4 {
+        margin-bottom: 8px;
+        font-size: 14px;
+        letter-spacing: 0.05em;
+        color: #ffa500;
+      }
+      .difficulty-buttons {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .difficulty-buttons button {
+        padding: 6px 8px;
+        border: 1px solid rgba(255,255,255,0.2);
+        border-radius: 4px;
+        background: rgba(255,255,255,0.08);
+        color: white;
+        font-size: 13px;
+        cursor: pointer;
+        transition: background 0.2s ease, border-color 0.2s ease;
+      }
+      .difficulty-buttons button:hover {
+        background: rgba(255,255,255,0.15);
+      }
+      .difficulty-buttons button.active {
+        border-color: #ffa500;
+        background: rgba(255,165,0,0.25);
+        box-shadow: 0 0 8px rgba(255,165,0,0.4);
+      }
+      .difficulty-buttons button:focus {
+        outline: none;
+        border-color: #ffffff;
+      }
+      .instructions h3 {
+        margin-bottom: 10px;
+        color: #ffa500;
+      }
+      .instructions div {
+        margin: 5px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+    <div id="ui">
+      <div>BORDERBOXES</div>
+      <div class="health-bar">
+        <div class="health-fill" id="health-fill" style="width: 100%"></div>
+      </div>
+      <div class="stamina-bar">
+        <div class="stamina-fill" id="stamina-fill" style="width: 100%"></div>
+      </div>
+      <div id="stats" style="margin-top: 10px;">
+        <div>Kills: <span id="kills">0</span></div>
+        <div>Room: <span id="room">lobby</span></div>
+      </div>
+    </div>
+    <div id="movement-state" class="movement-state"></div>
+    <div class="inventory" id="inventory"></div>
+    <div id="death-screen" class="death-screen">
+      <div class="death-title">YOU DIED</div>
+      <div class="respawn-timer">Respawning in <span id="respawn-countdown">3</span>...</div>
+      <div class="death-stats" id="death-stats"></div>
+    </div>
+    <div class="crosshair"></div>
+    <div class="difficulty-panel" id="difficulty-panel">
+      <h4>Difficulty</h4>
+      <div class="difficulty-buttons">
+        <button data-difficulty="easy">Easy</button>
+        <button data-difficulty="normal">Normal</button>
+        <button data-difficulty="hard">Hard</button>
+      </div>
+    </div>
+    <div class="instructions" id="instructions">
+      <h3>Click to Play</h3>
+      <div style="margin-bottom: 10px; color: #ffa500;">Click the game to lock your mouse</div>
+      <h3>Controls</h3>
+      <div>WASD - Move</div>
+      <div>SPACE - Jump</div>
+      <div>Mouse - Look/Aim</div>
+      <div>Left Click - Fire</div>
+      <div>E - Pickup</div>
+      <div>1-5 - Equip</div>
+      <div>ESC - Pause/Unlock Mouse</div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
