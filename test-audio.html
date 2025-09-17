@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Audio Test</title>
+  <script src="https://cdn.jsdelivr.net/npm/howler@2.2.4/dist/howler.min.js"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 800px;
+      margin: 50px auto;
+      padding: 20px;
+    }
+    button {
+      padding: 10px 20px;
+      margin: 5px;
+      font-size: 16px;
+      cursor: pointer;
+      background: #007bff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+    }
+    button:hover {
+      background: #0056b3;
+    }
+    .section {
+      margin: 20px 0;
+      padding: 20px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+    }
+    h2 {
+      margin-top: 0;
+    }
+    .status {
+      padding: 10px;
+      margin: 10px 0;
+      background: #f8f9fa;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎮 Borderboxes Audio Test</h1>
+
+  <div class="section">
+    <h2>🔫 Weapon Sounds</h2>
+    <button onclick="playSound('pistol')">Pistol</button>
+    <button onclick="playSound('smg')">SMG</button>
+    <button onclick="playSound('rifle')">Rifle</button>
+    <button onclick="playSound('shotgun')">Shotgun</button>
+  </div>
+
+  <div class="section">
+    <h2>💥 Player Damage</h2>
+    <button onclick="playPainSound(10)">Light Damage (10)</button>
+    <button onclick="playPainSound(30)">Medium Damage (30)</button>
+    <button onclick="playPainSound(60)">Heavy Damage (60)</button>
+    <button onclick="playDeathSound()">Death Sound</button>
+  </div>
+
+  <div class="section">
+    <h2>🎵 Music</h2>
+    <button onclick="playMusic('ambient')">Start Ambient Music</button>
+    <button onclick="playMusic('battle')">Start Battle Music</button>
+    <button onclick="stopMusic()">Stop Music</button>
+  </div>
+
+  <div class="section">
+    <h2>🎚️ Volume Controls</h2>
+    <label>Master Volume: <input type="range" id="masterVolume" min="0" max="100" value="50" onchange="setVolume(this.value)"></label>
+    <span id="volumeDisplay">50%</span>
+  </div>
+
+  <div class="status" id="status">Ready to test audio...</div>
+
+  <script>
+    const API_BASE = 'http://localhost:8787';
+    const AUDIO_BASE = `${API_BASE}/audio`;
+
+    let currentMusic = null;
+    let masterVolume = 0.5;
+
+    // Weapon sounds
+    const weaponSounds = {
+      pistol: new Howl({ src: [`${AUDIO_BASE}/sfx/weapons/pistol.wav`], volume: 0.5 }),
+      smg: new Howl({ src: [`${AUDIO_BASE}/sfx/weapons/smg.wav`], volume: 0.4 }),
+      rifle: new Howl({ src: [`${AUDIO_BASE}/sfx/weapons/rifle.wav`], volume: 0.6 }),
+      shotgun: new Howl({ src: [`${AUDIO_BASE}/sfx/weapons/shotgun.wav`], volume: 0.7 })
+    };
+
+    // Pain sounds
+    const painSounds = {
+      light: new Howl({ src: [`${AUDIO_BASE}/sfx/player/pain_light.wav`], volume: 0.3 }),
+      heavy: new Howl({ src: [`${AUDIO_BASE}/sfx/player/pain_heavy.wav`], volume: 0.5 }),
+      pain1: new Howl({ src: [`${AUDIO_BASE}/sfx/player/pain1.wav`], volume: 0.4 }),
+      pain2: new Howl({ src: [`${AUDIO_BASE}/sfx/player/pain2.wav`], volume: 0.4 }),
+      pain3: new Howl({ src: [`${AUDIO_BASE}/sfx/player/pain3.wav`], volume: 0.4 }),
+      pain4: new Howl({ src: [`${AUDIO_BASE}/sfx/player/pain4.wav`], volume: 0.4 }),
+      pain5: new Howl({ src: [`${AUDIO_BASE}/sfx/player/pain5.wav`], volume: 0.4 }),
+      pain6: new Howl({ src: [`${AUDIO_BASE}/sfx/player/pain6.wav`], volume: 0.4 })
+    };
+
+    // Death sounds
+    const deathSounds = [
+      new Howl({ src: [`${AUDIO_BASE}/sfx/player/death1.wav`], volume: 0.5 }),
+      new Howl({ src: [`${AUDIO_BASE}/sfx/player/die1.wav`], volume: 0.5 }),
+      new Howl({ src: [`${AUDIO_BASE}/sfx/player/die2.wav`], volume: 0.5 })
+    ];
+
+    // Music tracks
+    const musicTracks = {
+      ambient: [
+        new Howl({ src: [`${AUDIO_BASE}/music/ambient/new_hero.mp3`], volume: 0.3, loop: true }),
+        new Howl({ src: [`${AUDIO_BASE}/music/ambient/ice_giants.mp3`], volume: 0.3, loop: true }),
+        new Howl({ src: [`${AUDIO_BASE}/music/ambient/release_hybrids.mp3`], volume: 0.3, loop: true })
+      ],
+      battle: [
+        new Howl({ src: [`${AUDIO_BASE}/music/battle/battle_ready.mp3`], volume: 0.4, loop: true }),
+        new Howl({ src: [`${AUDIO_BASE}/music/battle/evil_incoming.mp3`], volume: 0.4, loop: true }),
+        new Howl({ src: [`${AUDIO_BASE}/music/battle/honor_bound.mp3`], volume: 0.4, loop: true })
+      ]
+    };
+
+    function updateStatus(message) {
+      document.getElementById('status').textContent = message;
+    }
+
+    function playSound(weapon) {
+      updateStatus(`Playing ${weapon} sound...`);
+      weaponSounds[weapon].play();
+    }
+
+    function playPainSound(damage) {
+      let sound;
+      if (damage >= 50) {
+        sound = painSounds.heavy;
+        updateStatus('Playing heavy pain sound...');
+      } else if (damage <= 10) {
+        sound = painSounds.light;
+        updateStatus('Playing light pain sound...');
+      } else {
+        const painIndex = Math.floor(Math.random() * 6) + 1;
+        sound = painSounds[`pain${painIndex}`];
+        updateStatus(`Playing pain${painIndex} sound...`);
+      }
+      sound.play();
+    }
+
+    function playDeathSound() {
+      const sound = deathSounds[Math.floor(Math.random() * deathSounds.length)];
+      updateStatus('Playing death sound...');
+      sound.play();
+    }
+
+    function playMusic(type) {
+      stopMusic();
+      const tracks = musicTracks[type];
+      currentMusic = tracks[Math.floor(Math.random() * tracks.length)];
+      currentMusic.play();
+      updateStatus(`Playing ${type} music...`);
+    }
+
+    function stopMusic() {
+      if (currentMusic) {
+        currentMusic.stop();
+        currentMusic = null;
+        updateStatus('Music stopped.');
+      }
+    }
+
+    function setVolume(value) {
+      masterVolume = value / 100;
+      Howler.volume(masterVolume);
+      document.getElementById('volumeDisplay').textContent = `${value}%`;
+      updateStatus(`Volume set to ${value}%`);
+    }
+
+    // Set initial volume
+    Howler.volume(masterVolume);
+
+    updateStatus('Audio test ready! Click buttons to test sounds.');
+  </script>
+</body>
+</html>

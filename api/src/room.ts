@@ -25,6 +25,8 @@ const JUMP = {
 const PLAYER_EYE_HEIGHT = 1.5;
 const WORLD_SIZE = 64;
 const FIXED_TICK = 1 / 60;
+const MAX_LIVES = 3;
+const SPECTATOR_TIMEOUT_MS = 45000;
 
 type Difficulty = 'easy' | 'normal' | 'hard';
 
@@ -122,6 +124,25 @@ export class Room {
     }
   }
 
+  private async handleAnalytics(data: any) {
+    try {
+      // Forward analytics to the main worker for storage
+      // (D1 is not directly accessible from Durable Objects)
+      const response = await fetch('https://borderboxes-api.highfive.workers.dev/telemetry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+
+      if (!response.ok) {
+        console.error('Failed to forward analytics:', response.status);
+      }
+    } catch (error) {
+      console.error('Failed to save analytics event:', error);
+      // Don't throw - analytics should not break gameplay
+    }
+  }
+
   private applyDamage(player: Player, baseDamage: number, sourceId: string) {
     if (player.invulnerable) return false;
     const scaled = Math.max(1, Math.round(baseDamage * this.getDifficultyConfig().damageMultiplier));
@@ -201,7 +222,10 @@ export class Room {
         jumpRequestedAt: 0,
         lastGroundTime: now,
         invulnerable: true,
-        invulnerableUntil: now + 5000
+        invulnerableUntil: now + 5000,
+        lives: MAX_LIVES,
+        isSpectator: false,
+        spectatorUntil: 0
       });
     }
 
@@ -222,6 +246,7 @@ export class Room {
         else if (msg.type === "pickup") this.handlePickup(playerId, msg.lootId);
         else if (msg.type === "equip") this.handleEquip(playerId, msg.itemId);
         else if (msg.type === "setDifficulty") this.handleDifficulty(playerId, msg.level);
+        else if (msg.type === "analytics") this.handleAnalytics(msg.data);
       } catch (e) {
         console.error("Error handling message:", e);
       }
@@ -256,6 +281,15 @@ export class Room {
 
     p.inputRight = Math.max(-1, Math.min(1, rawRight));
     p.inputForward = Math.max(-1, Math.min(1, -rawBack));
+
+    if (p.isSpectator) {
+      if (msg.aim) {
+        p.aimX = msg.aim[0];
+        p.aimY = msg.aim[1];
+        p.aimZ = msg.aim[2];
+      }
+      return;
+    }
 
     const jumpPressed = rawJump > 0.5;
     if (jumpPressed && !p.jumpHeld) {
@@ -315,6 +349,14 @@ export class Room {
     const item = player.inventory.find(i => i.seed === itemId);
     if (item) {
       player.equipped = item;
+
+      // Broadcast equip event to all players
+      this.broadcast({
+        type: 'event',
+        event: 'equip',
+        playerId,
+        item
+      });
     }
   }
 
@@ -434,7 +476,7 @@ export class Room {
       const alertRange = baseAlert * config.rangeMultiplier;
       const attackRange = baseAttack * config.rangeMultiplier;
       
-      if (nearestPlayer && nearestDist < alertRange) {
+    if (nearestPlayer && nearestDist < alertRange) {
         mob.state = nearestDist < attackRange ? 'attack' : 'alert';
         
         const dx = nearestPlayer.x - mob.x;
@@ -666,17 +708,43 @@ export class Room {
       }
 
       // Handle death/respawn transitions
+      if (player.isSpectator) {
+        if (player.spectatorUntil && now >= player.spectatorUntil) {
+          player.isSpectator = false;
+          player.lives = MAX_LIVES;
+          player.spectatorUntil = 0;
+          this.respawnPlayer(player);
+        } else {
+          player.firing = false;
+          continue;
+        }
+      }
+
       if (player.hp <= 0 && !player.isDead) {
         player.isDead = true;
+        player.lives = Math.max(0, player.lives - 1);
         this.broadcast({
           type: "event",
           event: "playerDeath",
           playerId: player.id,
           x: player.x,
           y: player.y,
-          z: player.z
+          z: player.z,
+          lives: player.lives
         });
-        setTimeout(() => this.respawnPlayer(player), 3000);
+
+        if (player.lives > 0) {
+          setTimeout(() => this.respawnPlayer(player), 3000);
+        } else {
+          player.isSpectator = true;
+          player.spectatorUntil = now + SPECTATOR_TIMEOUT_MS;
+          this.broadcast({
+            type: "event",
+            event: "spectator",
+            playerId: player.id,
+            until: player.spectatorUntil
+          });
+        }
         continue;
       }
 
@@ -881,7 +949,8 @@ export class Room {
       y: player.y,
       z: player.z,
       hp: player.hp,
-      invulnerable: true
+      invulnerable: true,
+      lives: player.lives
     });
   }
 
@@ -972,11 +1041,96 @@ export class Room {
       }
     }
 
-    // Apply damage to closest hit
-    if (closestHit) {
+    // Check other players for hits
+    let closestPlayerHit: { player: Player, distance: number, hitX: number, hitY: number, hitZ: number } | null = null;
+    for (const target of this.players.values()) {
+      if (target.id === player.id) continue;
+      if (target.isDead) continue;
+      if (target.invulnerable) continue;
+
+      const targetCenterX = target.x;
+      const targetCenterY = target.y + 0.9;
+      const targetCenterZ = target.z;
+
+      const toPlayerX = targetCenterX - originX;
+      const toPlayerY = targetCenterY - originY;
+      const toPlayerZ = targetCenterZ - originZ;
+      const distance = Math.sqrt(toPlayerX * toPlayerX + toPlayerY * toPlayerY + toPlayerZ * toPlayerZ);
+      if (distance > player.equipped.range) continue;
+
+      const dot = toPlayerX * dirX + toPlayerY * dirY + toPlayerZ * dirZ;
+      if (dot < 0) continue;
+
+      const closestX = originX + dirX * dot;
+      const closestY = originY + dirY * dot;
+      const closestZ = originZ + dirZ * dot;
+
+      const offX = targetCenterX - closestX;
+      const offY = targetCenterY - closestY;
+      const offZ = targetCenterZ - closestZ;
+      const rayDistance = Math.sqrt(offX * offX + offY * offY + offZ * offZ);
+      const hitboxRadius = 0.6;
+      if (rayDistance <= hitboxRadius) {
+        if (!closestPlayerHit || distance < closestPlayerHit.distance) {
+          closestPlayerHit = {
+            player: target,
+            distance,
+            hitX: closestX,
+            hitY: closestY,
+            hitZ: closestZ
+          };
+        }
+      }
+    }
+
+    let hitSomething = false;
+
+    if (closestPlayerHit && (!closestHit || closestPlayerHit.distance <= closestHit.distance)) {
+      const targetPlayer = closestPlayerHit.player;
+      const baseDamage = player.equipped.dps / player.equipped.fireRate;
+      const falloff = Math.max(0.5, 1 - (closestPlayerHit.distance / player.equipped.range) * 0.5);
+      const damage = Math.floor(baseDamage * falloff * (0.9 + Math.random() * 0.2));
+      const isCrit = Math.random() < 0.15;
+      const finalDamage = isCrit ? damage * 2 : damage;
+
+      if (!targetPlayer.invulnerable && !targetPlayer.isDead) {
+        targetPlayer.hp = Math.max(0, targetPlayer.hp - finalDamage);
+
+        this.broadcast({
+          type: "event",
+          event: "hit",
+          sourceId: player.id,
+          targetId: targetPlayer.id,
+          damage: finalDamage,
+          crit: isCrit,
+          x: targetPlayer.x,
+          y: targetPlayer.y + 1,
+          z: targetPlayer.z,
+          targetType: 'player'
+        });
+
+        this.broadcast({
+          type: "event",
+          event: "damage",
+          targetId: targetPlayer.id,
+          damage: finalDamage,
+          sourceId: player.id
+        });
+
+        if (targetPlayer.hp <= 0) {
+          this.broadcast({
+            type: "event",
+            event: "kill",
+            playerId: player.id,
+            victimId: targetPlayer.id
+          });
+        }
+      }
+
+      hitSomething = true;
+    } else if (closestHit) {
       const { mob, distance } = closestHit;
 
-      // Calculate damage with falloff
       const baseDamage = player.equipped.dps / player.equipped.fireRate;
       const falloff = Math.max(0.5, 1 - (distance / player.equipped.range) * 0.5);
       const damage = Math.floor(baseDamage * falloff * (0.9 + Math.random() * 0.2));
@@ -997,7 +1151,6 @@ export class Room {
         z: mob.z
       });
 
-      // Kill credit
       if (mob.hp <= 0) {
         this.broadcast({
           type: "event",
@@ -1006,6 +1159,8 @@ export class Room {
           mobId: mob.id
         });
       }
+
+      hitSomething = true;
     }
 
     // Broadcast shot event for visual effects
@@ -1015,7 +1170,7 @@ export class Room {
       playerId: player.id,
       origin: [originX, originY, originZ],
       direction: [dirX, dirY, dirZ],
-      hit: closestHit ? true : false
+      hit: hitSomething
     });
   }
 
@@ -1066,7 +1221,10 @@ export class Room {
         z: p.z,
         hp: p.hp,
         maxHp: p.maxHp,
-        equipped: p.equipped
+        equipped: p.equipped,
+        lives: p.lives,
+        isSpectator: p.isSpectator,
+        spectatorUntil: p.spectatorUntil
       })),
       mobs: Array.from(this.mobs.values()).map(m => ({
         id: m.id,
@@ -1120,6 +1278,9 @@ type Player = {
   jumpHeld: boolean;
   jumpRequestedAt: number;
   lastGroundTime: number;
+  lives: number;
+  isSpectator: boolean;
+  spectatorUntil: number;
   isDead?: boolean;
   invulnerable?: boolean;
   invulnerableUntil?: number;

@@ -6,31 +6,166 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass';
 import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader';
+import { audioManager } from './audio';
+import { VoxelModelLoader } from './voxelLoader';
 
 let ws: WebSocket;
+let isSpectator = false;
+let spectatorUntil = 0;
 
-const analyticsEndpoint = import.meta.env.DEV
-  ? 'http://localhost:8787/analytics'
-  : '/analytics';
+const API_BASE =
+  (import.meta.env.VITE_API_BASE as string | undefined) ??
+  (import.meta.env.DEV ? 'http://localhost:8787' : 'https://borderboxes-api.highfive.workers.dev');
+
+const analyticsEndpoint = `${API_BASE}/telemetry`;
+
+function hashString(input: string): number {
+  let hash = 0;
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash << 5) - hash + input.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+function getPlayerPalette(id: string) {
+  const palettes = [
+    { base: 0xf97316, accent: 0xfff3c4, glow: 0xffb347 },
+    { base: 0x2563eb, accent: 0xbfdbfe, glow: 0x60a5fa },
+    { base: 0x16a34a, accent: 0xd1fae5, glow: 0x34d399 },
+    { base: 0xdb2777, accent: 0xfbcfe8, glow: 0xf472b6 },
+    { base: 0x9333ea, accent: 0xe9d5ff, glow: 0xc084fc }
+  ];
+  const index = hashString(id) % palettes.length;
+  return palettes[index];
+}
+
+function createNamePlate(text: string, color: number): THREE.Sprite {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d')!;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.font = 'bold 32px "Press Start 2P", monospace';
+  ctx.fillStyle = '#000000aa';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#' + color.toString(16).padStart(6, '0');
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text.toUpperCase(), canvas.width / 2, canvas.height / 2);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(1.5, 0.4, 1);
+  sprite.position.y = 1.8;
+  return sprite;
+}
+
+function createOtherPlayerModel(id: string, name: string): THREE.Object3D {
+  const palette = getPlayerPalette(id);
+  const group = new THREE.Group();
+
+  const toonMat = new THREE.MeshToonMaterial({
+    color: palette.base,
+    emissive: palette.glow,
+    emissiveIntensity: 0.15
+  });
+  const accentMat = new THREE.MeshToonMaterial({
+    color: palette.accent,
+    emissive: palette.glow,
+    emissiveIntensity: 0.35
+  });
+  const outlineMat = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1 });
+
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.9, 0.4), toonMat);
+  torso.position.y = 0.9;
+  group.add(torso);
+
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55), accentMat);
+  head.position.y = 1.5;
+  group.add(head);
+
+  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.2, 0.52), new THREE.MeshToonMaterial({
+    color: 0x0f172a,
+    emissive: palette.glow,
+    emissiveIntensity: 0.6
+  }));
+  visor.position.set(0.15, 1.5, 0);
+  group.add(visor);
+
+  const leftArm = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.7, 0.2), accentMat);
+  leftArm.position.set(-0.46, 0.9, 0);
+  group.add(leftArm);
+  const rightArm = leftArm.clone();
+  rightArm.position.x = 0.46;
+  group.add(rightArm);
+
+  const leftLeg = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.8, 0.22), toonMat);
+  leftLeg.position.set(-0.18, 0.4, 0);
+  group.add(leftLeg);
+  const rightLeg = leftLeg.clone();
+  rightLeg.position.x = 0.18;
+  group.add(rightLeg);
+
+  const outlines = [torso, head, leftArm, rightArm, leftLeg, rightLeg].map(mesh => {
+    const edges = new THREE.EdgesGeometry(mesh.geometry as THREE.BufferGeometry);
+    const lines = new THREE.LineSegments(edges, outlineMat);
+    lines.position.copy(mesh.position);
+    return lines;
+  });
+  outlines.forEach(line => group.add(line));
+
+  const namePlate = createNamePlate(name || 'Player', palette.accent);
+  group.add(namePlate);
+  group.userData.nameLabel = namePlate;
+  group.userData.baseScale = 1;
+
+  group.traverse(obj => {
+    if ((obj as THREE.Mesh).isMesh) {
+      const mesh = obj as THREE.Mesh;
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+    }
+  });
+
+  return group;
+}
 
 function trackEvent(event: string, payload: Record<string, unknown> = {}) {
-  const body = JSON.stringify({
+  const data = {
     event,
     playerId: typeof pid === 'string' ? pid : undefined,
     timestamp: Date.now(),
     ...payload
-  });
+  };
+
+  // Try WebSocket first if connected
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'analytics',
+      data
+    }));
+    return;
+  }
+
+  // Fallback to HTTP if WebSocket not available
+  const body = JSON.stringify(data);
 
   if (navigator.sendBeacon) {
-    const success = navigator.sendBeacon(analyticsEndpoint, body);
+    // Create a Blob with proper Content-Type for sendBeacon
+    const blob = new Blob([body], { type: 'application/json' });
+    const success = navigator.sendBeacon(analyticsEndpoint, blob);
     if (success) return;
   }
 
+  // Fallback to fetch
   fetch(analyticsEndpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body,
-    keepalive: true
+    keepalive: true,
+    credentials: 'omit'  // Don't send cookies to avoid CORS issues
   }).catch(() => {
     // Swallow analytics errors; gameplay must continue
   });
@@ -58,6 +193,7 @@ function sendDifficulty(level: Difficulty) {
     ws.send(JSON.stringify({ type: 'setDifficulty', level }));
   }
   updateDifficultyUI(level);
+  audioManager.play('menu_click');
 }
 
 difficultyButtons.forEach(btn => {
@@ -222,6 +358,7 @@ const minScale = 0.75;
 let perfFrameCount = 0;
 let perfAccumMS = 0;
 let outlineThrottle = 0;
+let lastDamageTime = 0;
 
 function buildComposer() {
   composer = new EffectComposer(renderer);
@@ -293,6 +430,9 @@ interface Player {
   hp: number;
   maxHp: number;
   equipped: any;
+  lives?: number;
+  isSpectator?: boolean;
+  spectatorUntil?: number;
 }
 
 interface Mob {
@@ -417,15 +557,76 @@ const mobPalettes: Record<string, { base: number; accent: number; glow: number }
 };
 
 const mobPrototypes = new Map<string, THREE.Group>();
+const voxelLoader = VoxelModelLoader.getInstance();
+
+// Preload voxel models for enemies
+async function preloadEnemyModels() {
+  const modelPaths = [
+    { type: 'sniper', path: '/models/enemies/sniper/mechSniper.obj', format: 'obj', scale: 0.3 },
+    { type: 'tank', path: '/models/enemies/tank/ShockTrooper.obj', format: 'obj', scale: 0.4 },
+    { type: 'shooter', path: '/models/enemies/skeletons/shooter.vox', format: 'vox', scale: 0.5 },
+    { type: 'swarm', path: '/models/enemies/skeletons/swarm.vox', format: 'vox', scale: 0.3 },
+    { type: 'charger', path: '/models/enemies/chicken/ayam.dae', format: 'dae', scale: 0.35 },
+    { type: 'jumper', path: '/models/enemies/skeletons/charger.vox', format: 'vox', scale: 0.4 }
+  ];
+
+  for (const model of modelPaths) {
+    try {
+      const voxelModel = await voxelLoader.loadModel(model.path, model.format as 'obj' | 'dae' | 'vox', model.scale);
+      const group = new THREE.Group();
+      group.add(voxelModel);
+
+      // Set base scale based on enemy type
+      switch(model.type) {
+        case 'sniper': group.userData.baseScale = 1.3; break;
+        case 'tank': group.userData.baseScale = 1.5; break;
+        case 'shooter': group.userData.baseScale = 1.0; break;
+        case 'swarm': group.userData.baseScale = 0.8; break;
+        case 'charger': group.userData.baseScale = 1.1; break;
+        case 'jumper': group.userData.baseScale = 1.0; break;
+      }
+
+      mobPrototypes.set(model.type, group);
+      console.log(`Loaded voxel model for ${model.type}`);
+    } catch (error) {
+      console.warn(`Failed to load voxel model for ${model.type}, using procedural geometry`);
+    }
+  }
+}
 
 function clonePrototype(group: THREE.Group): THREE.Object3D {
   const clone = group.clone(true);
   clone.traverse(obj => {
     if ((obj as THREE.Mesh).isMesh) {
       const mesh = obj as THREE.Mesh;
-      mesh.material = (mesh.material as THREE.Material).clone();
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
+
+      // Validate geometry before using it
+      if (mesh.geometry) {
+        const positionAttribute = mesh.geometry.attributes.position;
+        if (positionAttribute) {
+          // Check for NaN values in position data
+          const positions = positionAttribute.array;
+          let hasNaN = false;
+          for (let i = 0; i < positions.length; i++) {
+            if (isNaN(positions[i])) {
+              hasNaN = true;
+              console.warn('Found NaN in geometry position data, skipping mesh');
+              break;
+            }
+          }
+
+          if (!hasNaN) {
+            mesh.material = (mesh.material as THREE.Material).clone();
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+          } else {
+            // Remove mesh with invalid geometry
+            if (mesh.parent) {
+              mesh.parent.remove(mesh);
+            }
+          }
+        }
+      }
     }
   });
   clone.userData.baseScale = group.userData.baseScale ?? 1;
@@ -645,6 +846,25 @@ const mobPrototypeFactories: Record<string, () => THREE.Group> = {
   default: buildDefaultPrototype
 };
 
+function disposeObject(obj: THREE.Object3D) {
+  obj.traverse(child => {
+    if ((child as THREE.Mesh).isMesh) {
+      const mesh = child as THREE.Mesh;
+      if (mesh.geometry) mesh.geometry.dispose();
+      if (Array.isArray(mesh.material)) {
+        mesh.material.forEach(mat => mat.dispose());
+      } else {
+        (mesh.material as THREE.Material)?.dispose();
+      }
+    }
+    if ((child as THREE.Sprite).isSprite) {
+      const sprite = child as THREE.Sprite;
+      if (sprite.material.map) sprite.material.map.dispose();
+      sprite.material.dispose();
+    }
+  });
+}
+
 function createMobModel(type: string): THREE.Object3D {
   const key = mobPrototypeFactories[type] ? type : 'default';
   let prototype = mobPrototypes.get(key);
@@ -774,127 +994,11 @@ me.visible = false; // Hide in first-person view
 scene.add(me);
 
 // Other players and entities
-const players = new Map<string, THREE.Mesh>();
+const players = new Map<string, THREE.Object3D>();
 const mobs = new Map<string, THREE.Object3D>();
 const lootDrops = new Map<string, THREE.Object3D>();
 
-// Audio system
-let audioContext: AudioContext | null = null;
-let masterGain: GainNode | null = null;
-
-// Initialize audio on first user interaction
-function initAudio() {
-  if (!audioContext) {
-    audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-    masterGain = audioContext.createGain();
-    masterGain.gain.value = 0.3; // Master volume
-    masterGain.connect(audioContext.destination);
-  }
-}
-
-// Play shooting sound
-function playShootSound(x: number, y: number, z: number) {
-  if (!audioContext || !masterGain) return;
-
-  // Calculate distance for volume
-  const distance = Math.sqrt(
-    Math.pow(x - localPosition.x, 2) +
-    Math.pow(y - localPosition.y, 2) +
-    Math.pow(z - localPosition.z, 2)
-  );
-
-  // Volume based on distance (max distance 50 units)
-  const volume = Math.max(0, 1 - distance / 50);
-  if (volume === 0) return;
-
-  // Create oscillator for gun sound
-  const oscillator = audioContext.createOscillator();
-  const gainNode = audioContext.createGain();
-  const filter = audioContext.createBiquadFilter();
-
-  // Configure gun sound
-  oscillator.type = 'sawtooth';
-  oscillator.frequency.value = 150; // Base frequency
-
-  // Low-pass filter for gun "pop"
-  filter.type = 'lowpass';
-  filter.frequency.value = 800;
-  filter.Q.value = 1;
-
-  // Connect nodes
-  oscillator.connect(filter);
-  filter.connect(gainNode);
-  gainNode.connect(masterGain);
-
-  // Set volume envelope
-  const now = audioContext.currentTime;
-  gainNode.gain.setValueAtTime(0, now);
-  gainNode.gain.linearRampToValueAtTime(volume * 0.8, now + 0.001); // Attack
-  gainNode.gain.exponentialRampToValueAtTime(volume * 0.1, now + 0.05); // Decay
-  gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.1); // Release
-
-  // Pitch envelope for "bang" effect
-  oscillator.frequency.setValueAtTime(400, now);
-  oscillator.frequency.exponentialRampToValueAtTime(100, now + 0.05);
-
-  // Play sound
-  oscillator.start(now);
-  oscillator.stop(now + 0.1);
-
-  // Add some white noise for texture
-  const noiseBuffer = audioContext.createBuffer(1, audioContext.sampleRate * 0.05, audioContext.sampleRate);
-  const noiseData = noiseBuffer.getChannelData(0);
-  for (let i = 0; i < noiseData.length; i++) {
-    noiseData[i] = (Math.random() - 0.5) * 0.5;
-  }
-
-  const noiseSource = audioContext.createBufferSource();
-  const noiseGain = audioContext.createGain();
-  noiseSource.buffer = noiseBuffer;
-
-  noiseSource.connect(noiseGain);
-  noiseGain.connect(masterGain);
-
-  noiseGain.gain.setValueAtTime(volume * 0.3, now);
-  noiseGain.gain.exponentialRampToValueAtTime(0.01, now + 0.03);
-
-  noiseSource.start(now);
-  noiseSource.stop(now + 0.03);
-}
-
-// Play hit sound
-function playHitSound(x: number, y: number, z: number) {
-  if (!audioContext || !masterGain) return;
-
-  const distance = Math.sqrt(
-    Math.pow(x - localPosition.x, 2) +
-    Math.pow(y - localPosition.y, 2) +
-    Math.pow(z - localPosition.z, 2)
-  );
-
-  const volume = Math.max(0, 1 - distance / 30);
-  if (volume === 0) return;
-
-  // Create impact sound
-  const oscillator = audioContext.createOscillator();
-  const gainNode = audioContext.createGain();
-
-  oscillator.type = 'sine';
-  oscillator.frequency.value = 200;
-
-  oscillator.connect(gainNode);
-  gainNode.connect(masterGain);
-
-  const now = audioContext.currentTime;
-  gainNode.gain.setValueAtTime(volume * 0.5, now);
-  gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
-
-  oscillator.frequency.setValueAtTime(800, now);
-  oscillator.frequency.exponentialRampToValueAtTime(100, now + 0.1);
-
-  oscillator.start(now);
-  oscillator.stop(now + 0.1);
-}
+// Audio system is now handled by AudioManager with Howler.js
 
 // Bullet trails and effects
 interface Bullet {
@@ -1193,6 +1297,7 @@ let pid = crypto.randomUUID();
 let myPlayer: Player | null = null;
 let inventory: any[] = [];
 let kills = 0;
+let lives = 3;
 
 // Client-side prediction
 let localPosition = { x: 32, y: 10, z: 32 };
@@ -1209,9 +1314,8 @@ const entityStates = new Map<string, {
 function connect() {
   // For local development, connect to localhost:8787
   // For production, use the actual worker URL
-  const wsUrl = import.meta.env.DEV
-    ? `ws://localhost:8787/rooms/lobby/ws?pid=${pid}`
-    : `wss://borderboxes-api.highfive.workers.dev/rooms/lobby/ws?pid=${pid}`;
+  const wsBase = API_BASE.replace(/^http/, 'ws');
+  const wsUrl = `${wsBase}/rooms/lobby/ws?pid=${pid}`;
 
   ws = new WebSocket(wsUrl);
 
@@ -1226,6 +1330,7 @@ function connect() {
       // Update inventory if player has items
       if (msg.player && msg.player.inventory) {
         inventory = msg.player.inventory;
+        console.log('Inventory updated:', inventory);
         updateInventoryUI();
       }
 
@@ -1242,8 +1347,15 @@ function connect() {
       }
       // Update players
       const snapshotPlayers = (msg.players ?? []) as Player[];
+      document.getElementById('players-online')!.textContent = snapshotPlayers.length.toString();
       const seenPlayers = new Set<string>();
       for (const p of snapshotPlayers) {
+        if (p.id === pid) {
+          lives = p.lives ?? lives;
+          isSpectator = !!p.isSpectator;
+          spectatorUntil = p.spectatorUntil ?? spectatorUntil;
+          updateSpectatorUI();
+        }
         seenPlayers.add(p.id);
 
         if (p.id === pid) {
@@ -1267,17 +1379,15 @@ function connect() {
             reconcileError.set(errX, errY, errZ);
           }
 
-          // Update health bar
-          const healthPercent = (p.hp / p.maxHp) * 100;
-          document.getElementById('health-fill')!.style.width = `${healthPercent}%`;
+      // Update health bar
+      const healthPercent = (p.hp / p.maxHp) * 100;
+      document.getElementById('health-fill')!.style.width = `${healthPercent}%`;
         } else {
           // Update other players with interpolation
           if (!players.has(p.id)) {
-            const mesh = new THREE.Mesh(geometries.player, materials.otherPlayer);
-            mesh.castShadow = true;
-            mesh.receiveShadow = true;
-            scene.add(mesh);
-            players.set(p.id, mesh);
+            const avatar = createOtherPlayerModel(p.id, p.name);
+            scene.add(avatar);
+            players.set(p.id, avatar);
           }
 
           // Store target position for interpolation
@@ -1299,6 +1409,7 @@ function connect() {
       // Remove disconnected players
       for (const [id, mesh] of players.entries()) {
         if (!seenPlayers.has(id)) {
+          disposeObject(mesh);
           scene.remove(mesh);
           players.delete(id);
           entityStates.delete(id);
@@ -1343,6 +1454,7 @@ function connect() {
       // Remove dead mobs
       for (const [id, mesh] of mobs.entries()) {
         if (!seenMobs.has(id)) {
+          disposeObject(mesh);
           scene.remove(mesh);
           mobs.delete(id);
           entityStates.delete(id);
@@ -1369,6 +1481,7 @@ function connect() {
       // Remove picked up loot
       for (const [id, mesh] of lootDrops.entries()) {
         if (!seenLoot.has(id)) {
+          disposeObject(mesh);
           scene.remove(mesh);
           lootDrops.delete(id);
         }
@@ -1386,6 +1499,7 @@ function connect() {
         if (msg.playerId === pid) {
           kills++;
           document.getElementById('kills')!.textContent = kills.toString();
+          audioManager.play('enemy_death');
         }
       }
 
@@ -1394,6 +1508,7 @@ function connect() {
         if (msg.playerId === pid) {
           inventory.push(msg.item);
           updateInventoryUI();
+          audioManager.play('pickup');
           if (myPlayer?.equipped && myPlayer.equipped.seed === msg.item.seed) {
             applyWeaponCosmetics(myPlayer.equipped);
           }
@@ -1409,17 +1524,43 @@ function connect() {
         const dirVec = new THREE.Vector3(msg.direction[0], msg.direction[1], msg.direction[2]).normalize();
 
         createBulletVisual(startVec, dirVec, !!msg.hit); // NEW visual with tracer + projectile
-        playShootSound(startVec.x, startVec.y, startVec.z); // keep audio but from correct start
+
+        // Play weapon sound based on the shooting player's equipped weapon
+        if (msg.playerId === pid) {
+          // Local player shooting
+          const weaponType = myPlayer?.equipped?.archetype || 'pistol';
+          const soundName = weaponType === 'smg' ? 'smg_fire' :
+                           weaponType === 'rifle' ? 'rifle_fire' :
+                           weaponType === 'shotgun' ? 'shotgun_fire' : 'pistol_fire';
+          audioManager.play(soundName);
+        } else {
+          // Other player shooting - use 3D positional audio
+          const weaponType = (players.get(msg.playerId) as any)?.equipped?.archetype || 'pistol';
+          const soundName = weaponType === 'smg' ? 'smg_fire' :
+                           weaponType === 'rifle' ? 'rifle_fire' :
+                           weaponType === 'shotgun' ? 'shotgun_fire' : 'pistol_fire';
+          audioManager.play3D(soundName, startVec, { maxDistance: 50 });
+        }
       }
 
       if (msg.event === 'hit') {
         createHitMarker(msg.x, msg.y, msg.z, msg.damage, msg.crit);
         createImpactParticles(msg.x, msg.y, msg.z);
-        playHitSound(msg.x, msg.y, msg.z);
+        // Hit sound is now handled by audioManager
+
+        // Play appropriate hit sound
+        if (msg.crit) {
+          audioManager.play3D('critical_hit', new THREE.Vector3(msg.x, msg.y, msg.z));
+        } else {
+          audioManager.play3D('hit_marker', new THREE.Vector3(msg.x, msg.y, msg.z));
+        }
       }
 
       if (msg.event === 'damage' && msg.targetId === pid) {
         trackEvent('damage_taken', { amount: msg.damage, sourceId: msg.sourceId });
+        // Play pain sound based on damage amount
+        audioManager.playPainSound(msg.damage);
+        lastDamageTime = performance.now();
         // Screen shake effect when player takes damage
         const shakeIntensity = Math.min(msg.damage * 0.002, 0.1);
         const shakeDuration = 200;
@@ -1471,6 +1612,10 @@ function connect() {
       }
 
       if (msg.event === 'playerDeath' && msg.playerId === pid) {
+        lives = msg.lives ?? Math.max(0, lives - 1);
+        updateSpectatorUI();
+        // Play death sound
+        audioManager.playDeathSound();
         // Show death screen
         const deathScreen = document.getElementById('death-screen');
         const respawnTimer = document.getElementById('respawn-timer');
@@ -1495,13 +1640,37 @@ function connect() {
 
       if (msg.event === 'equip' && msg.item) {
         trackEvent('weapon_equip', { playerId: msg.playerId, rarity: msg.item.rarity, archetype: msg.item.archetype });
+        trackEvent('weapon_equip', { playerId: msg.playerId, rarity: msg.item.rarity, archetype: msg.item.archetype });
         if (msg.playerId === pid) {
           myPlayer = myPlayer ? { ...myPlayer, equipped: msg.item } : myPlayer;
+          console.log('Player equipped weapon:', msg.item);
           applyWeaponCosmetics(msg.item);
+
+          // Play equip sound
+          audioManager.play('menu_click');
+        } else {
+          // Update other player's equipped weapon
+          const otherPlayer = players.get(msg.playerId);
+          if (otherPlayer) {
+            (otherPlayer as any).equipped = msg.item;
+          }
         }
       }
 
+      if (msg.event === 'spectator' && msg.playerId === pid) {
+        isSpectator = true;
+        spectatorUntil = msg.until ?? (Date.now() + 45000);
+        firing = false;
+        updateSpectatorUI();
+      }
+
       if (msg.event === 'playerRespawn' && msg.playerId === pid) {
+        lives = msg.lives ?? lives;
+        isSpectator = false;
+        spectatorUntil = 0;
+        updateSpectatorUI();
+        // Hide death screen
+        audioManager.play('respawn');
         // Hide death screen
         const deathScreen = document.getElementById('death-screen');
         if (deathScreen) {
@@ -1526,7 +1695,6 @@ function connect() {
           const flashInterval = setInterval(() => {
             flashCount++;
             materials.player.opacity = flashCount % 2 === 0 ? 0.5 : 0.8;
-            
             if (flashCount >= 6) { // 3 seconds of flashing
               clearInterval(flashInterval);
               materials.player.opacity = originalOpacity;
@@ -1558,7 +1726,7 @@ let isPointerLocked = false;
 canvas.addEventListener('click', (e) => {
   e.preventDefault();
   if (!isPointerLocked) {
-    initAudio(); // Initialize audio on first interaction
+    // Audio is now initialized automatically by AudioManager
     ensureGunModel(); // NEW: create/attach simple gun + muzzle anchor
     canvas.requestPointerLock();
   }
@@ -1635,6 +1803,11 @@ document.addEventListener('keydown', (e) => {
     }
   }
 
+  // Mute/unmute
+  if (e.code === 'KeyM') {
+    audioManager.toggle();
+  }
+
   // Pickup nearby loot
   if (e.code === 'KeyE' && myPlayer) {
     for (const [id, mesh] of lootDrops.entries()) {
@@ -1650,8 +1823,12 @@ document.addEventListener('keydown', (e) => {
   // Equip items
   if (e.code >= 'Digit1' && e.code <= 'Digit5') {
     const index = parseInt(e.code.substring(5)) - 1;
+    console.log(`Equip key pressed: ${e.code}, index: ${index}, inventory:`, inventory);
     if (inventory[index]) {
+      console.log(`Equipping item:`, inventory[index]);
       ws?.send(JSON.stringify({ type: 'equip', itemId: inventory[index].seed }));
+    } else {
+      console.log(`No item in slot ${index + 1}`);
     }
   }
 });
@@ -1748,6 +1925,10 @@ function updateLocalPhysics() {
   const onGround = localPosition.y <= terrainHeight + 0.1;
   
   // Update stamina
+  if (isSpectator) {
+    return;
+  }
+
   if (isSprinting && (keys.has('KeyW') || keys.has('KeyS') || keys.has('KeyA') || keys.has('KeyD'))) {
     stamina = Math.max(0, stamina - dt * 20);
     if (stamina <= 0) {
@@ -1914,11 +2095,11 @@ function updateLocalPhysics() {
 function sendInput() {
   if (!ws || ws.readyState !== 1) return;
 
-  const move = [
-    (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0),
-    keys.has('Space') ? 1 : 0,
-    (keys.has('KeyS') ? 1 : 0) - (keys.has('KeyW') ? 1 : 0)
-  ];
+  const moveRight = isSpectator ? 0 : (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  const moveJump = isSpectator ? 0 : (keys.has('Space') ? 1 : 0);
+  const moveForward = isSpectator ? 0 : (keys.has('KeyS') ? 1 : 0) - (keys.has('KeyW') ? 1 : 0);
+
+  const move = [moveRight, moveJump, moveForward];
 
   // Calculate aim direction from camera orientation
   let aimDir;
@@ -1965,7 +2146,7 @@ function updateInventoryUI() {
     if (inventory[i]) {
       const item = inventory[i];
       slot.classList.add(item.rarity);
-      if (myPlayer?.equipped?.seed === item.seed) {
+      if (myPlayer?.equipped && myPlayer.equipped.seed === item.seed) {
         slot.classList.add('equipped');
       }
       slot.innerHTML = `
@@ -1993,6 +2174,20 @@ function updateCamera() {
   camera.rotation.x = pitch;
 }
 
+function updateSpectatorUI() {
+  const overlay = document.getElementById('spectator-overlay');
+  const countdownLabel = document.getElementById('spectator-countdown');
+  if (!overlay || !countdownLabel) return;
+
+  if (isSpectator) {
+    overlay.style.display = 'flex';
+    const remaining = Math.max(0, spectatorUntil - Date.now());
+    countdownLabel.textContent = Math.ceil(remaining / 1000).toString();
+  } else {
+    overlay.style.display = 'none';
+  }
+}
+
 function updateUI() {
   // Update stamina bar
   const staminaBar = document.getElementById('stamina-fill');
@@ -2001,6 +2196,11 @@ function updateUI() {
   }
   
   // Update movement state indicator
+  const livesLabel = document.getElementById('lives');
+  if (livesLabel) {
+    livesLabel.textContent = lives.toString();
+  }
+
   const movementState = document.getElementById('movement-state');
   if (movementState) {
     let state = '';
@@ -2025,7 +2225,6 @@ function resize() {
 
   if (composer) {
     composer.setSize(w, h);
-    outlinePass?.setSize(w, h);
   }
 
   camera.aspect = w / h;
@@ -2093,13 +2292,20 @@ function animate() {
     const z = state.current.z + (state.target.z - state.current.z) * easedT;
 
     const playerMesh = players.get(id);
-    if (playerMesh) playerMesh.position.set(x, y, z);
+    if (playerMesh) {
+      playerMesh.position.set(x, y, z);
+      const nameLabel = playerMesh.userData.nameLabel as THREE.Object3D | undefined;
+      if (nameLabel) {
+        nameLabel.lookAt(camera.position);
+      }
+    }
     const mobMesh = mobs.get(id);
     if (mobMesh) mobMesh.position.set(x, y, z);
   }
 
   updateCamera();
   updateUI();
+  updateSpectatorUI();
 
   // Animate loot drops with smooth bobbing
   for (const mesh of lootDrops.values()) {
@@ -2174,6 +2380,26 @@ function animate() {
     }
   }
 
+  // Fade out muzzle flashes quickly
+  for (let i = muzzleFlashes.length - 1; i >= 0; i--) {
+    const entry = muzzleFlashes[i];
+    const elapsed = now - entry.startTime;
+    const life = 120; // ms
+    const sprite = entry.mesh;
+    const material = sprite.material as THREE.SpriteMaterial;
+    if (elapsed >= life) {
+      scene.remove(sprite);
+      if (material.map) material.map.dispose();
+      material.dispose();
+      muzzleFlashes.splice(i, 1);
+    } else {
+      const alpha = 1 - elapsed / life;
+      material.opacity = alpha;
+      const scale = sprite.scale.x;
+      sprite.scale.set(scale * (0.98), scale * (0.98), 1);
+    }
+  }
+
   // Throttled enemy outline targeting
   if (outlinePass) {
     outlineThrottle = (outlineThrottle + 1) % 3; // every 3rd frame
@@ -2193,6 +2419,41 @@ function animate() {
     composer.render();
   } else {
     renderer.render(scene, camera);
+  }
+
+  // Update audio listener position with camera
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  audioManager.updateListener(camera.position, forward);
+
+  // Update combat intensity for dynamic music
+  if (me && myPlayer) {
+    let enemiesNearby = 0;
+    const playerPos = me.position;
+
+    // Count nearby enemy players (other players within 30 units)
+    players.forEach((playerObj, playerId) => {
+      if (playerId !== pid) {
+        const distance = playerObj.position.distanceTo(playerPos);
+        if (distance < 30) {
+          enemiesNearby++;
+        }
+      }
+    });
+
+    // Count nearby mobs (AI enemies within 30 units)
+    mobs.forEach((mobObj) => {
+      const distance = mobObj.position.distanceTo(playerPos);
+      if (distance < 30) {
+        enemiesNearby++;
+      }
+    });
+
+    // Check if taking damage (recent damage indicator)
+    const takingDamage = lastDamageTime > 0 && (performance.now() - lastDamageTime < 3000);
+
+    // Update combat intensity for dynamic music
+    audioManager.updateCombatIntensity(enemiesNearby, takingDamage);
   }
 
   requestAnimationFrame(animate);
@@ -2285,6 +2546,44 @@ function createBulletVisual(start: THREE.Vector3, direction: THREE.Vector3, hit:
   }
 }
 
-// Start game
-connect();
-animate();
+// Set up volume controls
+const volumeSlider = document.getElementById('volume-slider') as HTMLInputElement;
+const volumeValue = document.getElementById('volume-value');
+
+if (volumeSlider && volumeValue) {
+  volumeSlider.addEventListener('input', (e) => {
+    const volume = parseInt((e.target as HTMLInputElement).value, 10) / 100;
+    audioManager.setMasterVolume(volume);
+    volumeValue.textContent = `${(e.target as HTMLInputElement).value}%`;
+  });
+
+  // Set initial volume
+  audioManager.setMasterVolume(0.7);
+}
+
+// Start background music after first user interaction
+let musicStarted = false;
+const startBackgroundMusic = () => {
+  if (!musicStarted) {
+    audioManager.startAmbientMusic();
+    musicStarted = true;
+  }
+};
+
+document.addEventListener('click', startBackgroundMusic, { once: true });
+document.addEventListener('keydown', startBackgroundMusic, { once: true });
+
+// Preload voxel models for enemies before starting game
+preloadEnemyModels().then(() => {
+  console.log('Voxel enemy models preloaded');
+
+  // Start game after models are loaded
+  connect();
+  animate();
+}).catch((error) => {
+  console.warn('Failed to preload some enemy models:', error);
+
+  // Start game anyway with procedural geometry
+  connect();
+  animate();
+});

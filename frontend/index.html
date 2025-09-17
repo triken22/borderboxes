@@ -170,6 +170,52 @@
         font-size: 14px;
         max-width: 200px;
       }
+      .spectator-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(10, 10, 10, 0.8);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 2000;
+      }
+      .spectator-card {
+        background: rgba(26, 26, 26, 0.95);
+        border: 2px solid #ff8c00;
+        padding: 32px 40px;
+        border-radius: 12px;
+        text-align: center;
+        box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+      }
+      .spectator-card h2 {
+        margin-bottom: 12px;
+        font-size: 28px;
+        color: #ffb347;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+      }
+      .spectator-card p {
+        margin-bottom: 16px;
+        color: #d1d5db;
+      }
+      .spectator-card .countdown {
+        font-size: 18px;
+        color: #fff;
+        background: rgba(255, 140, 0, 0.2);
+        padding: 8px 12px;
+        border-radius: 8px;
+        display: inline-block;
+      }
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        color: white;
+        background: rgba(0,0,0,0.6);
+        padding: 15px;
+        border-radius: 4px;
+        font-size: 14px;
+        max-width: 200px;
+      }
       .difficulty-panel {
         position: fixed;
         top: 20px;
@@ -238,6 +284,8 @@
       <div id="stats" style="margin-top: 10px;">
         <div>Kills: <span id="kills">0</span></div>
         <div>Room: <span id="room">lobby</span></div>
+        <div>Players Online: <span id="players-online">0</span></div>
+        <div>Lives: <span id="lives">3</span></div>
       </div>
     </div>
     <div id="movement-state" class="movement-state"></div>
@@ -256,6 +304,13 @@
         <button data-difficulty="hard">Hard</button>
       </div>
     </div>
+    <div id="spectator-overlay" class="spectator-overlay" style="display:none;">
+      <div class="spectator-card">
+        <h2>You are spectating</h2>
+        <p>Out of lives. Watch the fight while your suit recharges.</p>
+        <div class="countdown">Respawn in <span id="spectator-countdown">45</span>s</div>
+      </div>
+    </div>
     <div class="instructions" id="instructions">
       <h3>Click to Play</h3>
       <div style="margin-bottom: 10px; color: #ffa500;">Click the game to lock your mouse</div>
@@ -266,7 +321,13 @@
       <div>Left Click - Fire</div>
       <div>E - Pickup</div>
       <div>1-5 - Equip</div>
+      <div>M - Mute/Unmute</div>
       <div>ESC - Pause/Unlock Mouse</div>
+      <div style="margin-top: 10px;">
+        <label style="font-size: 12px;">Volume: <span id="volume-value">70%</span></label>
+        <input type="range" id="volume-slider" min="0" max="100" value="70"
+               style="width: 100%; margin-top: 5px; pointer-events: auto;">
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

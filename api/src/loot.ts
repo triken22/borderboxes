@@ -1,6 +1,6 @@
 // server/loot.ts
 export type Gun = {
-  archetype: 'pistol' | 'smg' | 'rifle';
+  archetype: 'pistol' | 'smg' | 'rifle' | 'shotgun';
   rarity: 'common' | 'rare' | 'epic' | 'legendary';
   dps: number;
   mag: number;
@@ -13,7 +13,7 @@ export type Gun = {
 
 export function rollGun(seed: string): Gun {
   const rnd = mulberry32(hash(seed));
-  const archetypes: Gun['archetype'][] = ['pistol', 'smg', 'rifle'];
+  const archetypes: Gun['archetype'][] = ['pistol', 'smg', 'rifle', 'shotgun'];
   const rarityTable = ['common', 'common', 'rare', 'rare', 'epic', 'legendary'] as const;
 
   const archetype = archetypes[Math.floor(rnd() * archetypes.length)];
@@ -23,7 +23,8 @@ export function rollGun(seed: string): Gun {
   const base = {
     pistol: { dps: 80, mag: 12, reload: 1100, fireRate: 3, accuracy: 0.85, range: 25 },
     smg: { dps: 140, mag: 30, reload: 1500, fireRate: 10, accuracy: 0.7, range: 20 },
-    rifle: { dps: 200, mag: 24, reload: 1800, fireRate: 2, accuracy: 0.95, range: 40 }
+    rifle: { dps: 200, mag: 24, reload: 1800, fireRate: 2, accuracy: 0.95, range: 40 },
+    shotgun: { dps: 250, mag: 6, reload: 2000, fireRate: 1, accuracy: 0.6, range: 15 }
   }[archetype];
 
   // Rarity multipliers

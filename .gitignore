@@ -61,6 +61,49 @@ wrangler.toml
 # OS files
 Thumbs.db
 
+# Audio files (stored in R2, not in git)
+*.mp3
+*.wav
+*.ogg
+*.m4a
+*.aac
+*.flac
+*.wma
+audio/
+sounds/
+sfx/
+music/
+
+# Asset files (models, textures, etc)
+*.obj
+*.mtl
+*.dae
+*.vox
+*.fbx
+*.gltf
+*.glb
+*.3ds
+*.blend
+*.max
+*.maya
+*.c4d
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tga
+*.tiff
+*.psd
+*.svg
+*.ico
+*.webp
+models/
+textures/
+assets/
+sprites/
+images/
+
 # Documentation
 *.md
 !README.md
