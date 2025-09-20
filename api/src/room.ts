@@ -143,10 +143,65 @@ export class Room {
     }
   }
 
-  private applyDamage(player: Player, baseDamage: number, sourceId: string) {
+  private handleDamageAck(playerId: string, msg: any) {
+    if (!msg || typeof msg !== 'object') return;
+    const player = this.players.get(playerId);
+    if (!player) return;
+    if (!msg.ignored) return;
+
+    if (msg.reason === 'spectator') {
+      player.lastSpectatorAck = Date.now();
+    }
+  }
+
+  private hasLineOfSight(
+    ax: number,
+    ay: number,
+    az: number,
+    bx: number,
+    by: number,
+    bz: number
+  ): boolean {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const dz = bz - az;
+    const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const steps = Math.max(4, Math.ceil(distance * 1.5));
+    for (let i = 1; i < steps; i++) {
+      const t = i / steps;
+      const sx = ax + dx * t;
+      const sz = az + dz * t;
+      const sy = ay + dy * t;
+      const terrainTop = this.getTerrainHeight(sx, sz) + 0.6;
+      if (terrainTop > sy) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private applyDamage(player: Player, baseDamage: number, sourceId: string, options: { ignoreLineOfSight?: boolean } = {}) {
     if (player.invulnerable) return false;
+    const now = Date.now();
+    const COOLDOWN_MS = 200;
+    if (player.lastDamageAt && now - player.lastDamageAt < COOLDOWN_MS) {
+      return false;
+    }
+
+    if (!options.ignoreLineOfSight) {
+      const sourceMob = this.mobs.get(sourceId);
+      if (sourceMob) {
+        const sourceY = sourceMob.y + 0.8;
+        const targetY = player.y + PLAYER_EYE_HEIGHT;
+        if (!this.hasLineOfSight(sourceMob.x, sourceY, sourceMob.z, player.x, targetY, player.z)) {
+          return false;
+        }
+      }
+    }
+
     const scaled = Math.max(1, Math.round(baseDamage * this.getDifficultyConfig().damageMultiplier));
     player.hp = Math.max(0, player.hp - scaled);
+    player.lastDamageAt = now;
     this.broadcast({
       type: 'event',
       event: 'damage',
@@ -225,7 +280,8 @@ export class Room {
         invulnerableUntil: now + 5000,
         lives: MAX_LIVES,
         isSpectator: false,
-        spectatorUntil: 0
+        spectatorUntil: 0,
+        lastSpectatorAck: 0
       });
     }
 
@@ -247,6 +303,7 @@ export class Room {
         else if (msg.type === "equip") this.handleEquip(playerId, msg.itemId);
         else if (msg.type === "setDifficulty") this.handleDifficulty(playerId, msg.level);
         else if (msg.type === "analytics") this.handleAnalytics(msg.data);
+        else if (msg.type === "damageAck") this.handleDamageAck(playerId, msg);
       } catch (e) {
         console.error("Error handling message:", e);
       }
@@ -306,6 +363,10 @@ export class Room {
       p.aimX = msg.aim[0];
       p.aimY = msg.aim[1];
       p.aimZ = msg.aim[2];
+    }
+
+    if (typeof msg.ads === 'boolean') {
+      p.ads = !!msg.ads;
     }
 
     p.firing = !!msg.firing;
@@ -486,11 +547,12 @@ export class Room {
         // Type-specific behavior
         switch (mob.type) {
           case 'charger':
-            // Rush towards player
-            mob.vx = (dx / dist) * 0.15 * speedScale;
-            mob.vz = (dz / dist) * 0.15 * speedScale;
-            if (dist < 2 && now - mob.lastAttackTime > 500) {
-              if (this.applyDamage(nearestPlayer, 15, mob.id)) {
+            // Rush towards player with heavier mass
+            const chargeSpeed = 0.12 * speedScale;
+            mob.vx = (dx / dist) * chargeSpeed;
+            mob.vz = (dz / dist) * chargeSpeed;
+            if (dist < 3.2 && now - mob.lastAttackTime > 650) {
+              if (this.applyDamage(nearestPlayer, 18, mob.id)) {
                 mob.lastAttackTime = now;
               }
             }
@@ -501,51 +563,51 @@ export class Room {
             const groundHere = this.getTerrainHeight(mob.x, mob.z);
             const onGround = Math.abs(mob.y - groundHere) < 0.05;
             mob.jumpCooldown = (mob.jumpCooldown ?? 0) - dt;
-            if (mob.jumpCooldown <= 0 && dist < 15 && onGround) {
-              mob.vx = (dx / dist) * 0.3 * speedScale;
-              mob.vy = 0.5;
-              mob.vz = (dz / dist) * 0.3 * speedScale;
-              mob.jumpCooldown = 2;
+            if (mob.jumpCooldown <= 0 && dist < 16 && onGround) {
+              mob.vx = (dx / dist) * 0.26 * speedScale;
+              mob.vy = 0.6;
+              mob.vz = (dz / dist) * 0.26 * speedScale;
+              mob.jumpCooldown = 2.25;
             }
-            if (dist < 3 && now - mob.lastAttackTime > 1000) {
-              if (this.applyDamage(nearestPlayer, 20, mob.id)) {
+            if (dist < 3.4 && now - mob.lastAttackTime > 1050) {
+              if (this.applyDamage(nearestPlayer, 22, mob.id)) {
                 mob.lastAttackTime = now;
               }
             }
             break;
             
           case 'sniper':
-            // Keep distance
-            if (dist < 25) {
-              mob.vx = -(dx / dist) * 0.05 * speedScale;
-              mob.vz = -(dz / dist) * 0.05 * speedScale;
-            } else if (dist > 35) {
-              mob.vx = (dx / dist) * 0.03 * speedScale;
-              mob.vz = (dz / dist) * 0.03 * speedScale;
+            // Keep distance with larger footprint
+            if (dist < 30) {
+              mob.vx = -(dx / dist) * 0.045 * speedScale;
+              mob.vz = -(dz / dist) * 0.045 * speedScale;
+            } else if (dist > 40) {
+              mob.vx = (dx / dist) * 0.028 * speedScale;
+              mob.vz = (dz / dist) * 0.028 * speedScale;
             } else {
               mob.vx = 0;
               mob.vz = 0;
             }
-            if (dist < 40 && now - mob.lastAttackTime > 3000) {
-              if (this.applyDamage(nearestPlayer, 35, mob.id)) {
+            if (dist < 48 && now - mob.lastAttackTime > 3200) {
+              if (this.applyDamage(nearestPlayer, 38, mob.id)) {
                 mob.lastAttackTime = now;
               }
             }
             break;
             
           case 'tank':
-            // Slow approach
-            mob.vx = (dx / dist) * 0.04 * speedScale;
-            mob.vz = (dz / dist) * 0.04 * speedScale;
-            if (dist < 5 && now - mob.lastAttackTime > 2000) {
-              // Area damage
+            // Slow approach with heavy tread
+            mob.vx = (dx / dist) * 0.038 * speedScale;
+            mob.vz = (dz / dist) * 0.038 * speedScale;
+            if (dist < 5.5 && now - mob.lastAttackTime > 2100) {
+              // Area damage with larger blast
               for (const player of this.players.values()) {
                 const pdx = player.x - mob.x;
                 const pdz = player.z - mob.z;
                 const pdist = Math.sqrt(pdx * pdx + pdz * pdz);
-                if (pdist < 8) {
-                  const damage = Math.max(1, Math.floor(25 - pdist * 3));
-                  this.applyDamage(player, damage, mob.id);
+                if (pdist < 9) {
+                  const damage = Math.max(1, Math.floor(28 - pdist * 2.6));
+                  this.applyDamage(player, damage, mob.id, { ignoreLineOfSight: true });
                 }
               }
               mob.lastAttackTime = now;
@@ -554,8 +616,8 @@ export class Room {
             
           case 'swarm':
             // Fast swarming
-            mob.vx = (dx / dist) * 0.12 * speedScale;
-            mob.vz = (dz / dist) * 0.12 * speedScale;
+            mob.vx = (dx / dist) * 0.1 * speedScale;
+            mob.vz = (dz / dist) * 0.1 * speedScale;
             // Flocking behavior
             for (const other of this.mobs.values()) {
               if (other.id !== mob.id && other.type === 'swarm') {
@@ -571,8 +633,8 @@ export class Room {
                 }
               }
             }
-            if (dist < 2 && now - mob.lastAttackTime > 500) {
-              if (this.applyDamage(nearestPlayer, 5, mob.id)) {
+            if (dist < 2.6 && now - mob.lastAttackTime > 550) {
+              if (this.applyDamage(nearestPlayer, 6, mob.id)) {
                 mob.lastAttackTime = now;
               }
             }
@@ -581,16 +643,16 @@ export class Room {
           case 'shooter':
           default:
             // Keep distance and shoot
-            const idealDist = 15;
+            const idealDist = 18;
             if (dist > idealDist) {
-              mob.vx = (dx / dist) * 0.08 * speedScale;
-              mob.vz = (dz / dist) * 0.08 * speedScale;
-            } else if (dist < idealDist - 5) {
-              mob.vx = -(dx / dist) * 0.08 * speedScale;
-              mob.vz = -(dz / dist) * 0.08 * speedScale;
+              mob.vx = (dx / dist) * 0.09 * speedScale;
+              mob.vz = (dz / dist) * 0.09 * speedScale;
+            } else if (dist < idealDist - 6) {
+              mob.vx = -(dx / dist) * 0.09 * speedScale;
+              mob.vz = -(dz / dist) * 0.09 * speedScale;
             }
-            if (dist < 20 && now - mob.lastAttackTime > 1000) {
-              if (this.applyDamage(nearestPlayer, 10, mob.id)) {
+            if (dist < 26 && now - mob.lastAttackTime > 900) {
+              if (this.applyDamage(nearestPlayer, 12, mob.id)) {
                 mob.lastAttackTime = now;
               }
             }
@@ -701,13 +763,11 @@ export class Room {
     const now = Date.now();
 
     for (const player of this.players.values()) {
-      // Expire spawn protection without relying on timeouts
       if (player.invulnerable && player.invulnerableUntil && now >= player.invulnerableUntil) {
         player.invulnerable = false;
         player.invulnerableUntil = undefined;
       }
 
-      // Handle death/respawn transitions
       if (player.isSpectator) {
         if (player.spectatorUntil && now >= player.spectatorUntil) {
           player.isSpectator = false;
@@ -753,12 +813,10 @@ export class Room {
         continue;
       }
 
-      // Expire buffered jump requests
       if (player.jumpQueued && now - player.jumpRequestedAt > JUMP.bufferMs) {
         player.jumpQueued = false;
       }
 
-      // Determine movement basis from aim direction
       let forwardX = 0;
       let forwardZ = -1;
       const aimLen = Math.sqrt(player.aimX * player.aimX + player.aimY * player.aimY + player.aimZ * player.aimZ);
@@ -774,7 +832,6 @@ export class Room {
       const rightX = forwardZ;
       const rightZ = -forwardX;
 
-      // Combine inputs into desired velocity
       let desiredX = rightX * player.inputRight + forwardX * player.inputForward;
       let desiredZ = rightZ * player.inputRight + forwardZ * player.inputForward;
       const desiredLen = Math.hypot(desiredX, desiredZ);
@@ -783,8 +840,11 @@ export class Room {
         desiredZ /= desiredLen;
       }
 
-      const targetVx = desiredX * MOVE.maxSpeed;
-      const targetVz = desiredZ * MOVE.maxSpeed;
+      // ADS imposes a small speed penalty server-side for fairness
+      const adsSpeedScale = player.ads ? 0.85 : 1.0;
+
+      const targetVx = desiredX * MOVE.maxSpeed * adsSpeedScale;
+      const targetVz = desiredZ * MOVE.maxSpeed * adsSpeedScale;
 
       const ground = this.getTerrainHeight(player.x, player.z);
       const onGround = player.y <= ground + 0.05;
@@ -810,7 +870,6 @@ export class Room {
         player.vz *= 1 - PHYSICS.airResistance * dt;
       }
 
-      // Jump buffer + coyote time
       const canJump = onGround || now - player.lastGroundTime < JUMP.coyoteMs;
       if (player.jumpQueued && canJump) {
         player.vy = PHYSICS.jumpPower;
@@ -818,7 +877,6 @@ export class Room {
         player.jumpHeld = true;
       }
 
-      // Gravity
       if (!onGround) {
         player.vy -= PHYSICS.gravity * dt;
         if (player.vy < -PHYSICS.terminalVelocity) {
@@ -828,7 +886,6 @@ export class Room {
         player.vy = 0;
       }
 
-      // Integrate position
       player.x += player.vx * dt;
       player.y += player.vy * dt;
       player.z += player.vz * dt;
@@ -842,7 +899,6 @@ export class Room {
         player.lastGroundTime = now;
       }
 
-      // Bounds and simple wall response
       if (player.x < 0 || player.x > WORLD_SIZE) {
         player.x = Math.max(0, Math.min(WORLD_SIZE, player.x));
         player.vx = 0;
@@ -852,7 +908,6 @@ export class Room {
         player.vz = 0;
       }
 
-      // Handle firing cadence
       if (player.firing && player.equipped) {
         const fireDelay = 1000 / player.equipped.fireRate;
         if (now - player.lastFireTime > fireDelay) {
@@ -957,13 +1012,17 @@ export class Room {
   private handleFire(player: Player) {
     if (!player.equipped) return;
 
-    // Calculate spread based on weapon accuracy
-    const spread = (1 - player.equipped.accuracy) * 0.1;
+    // ADS and movement influence spread
+    const baseSpread = (1 - player.equipped.accuracy) * 0.1;
+    const adsScale = player.ads ? 0.4 : 1.0;
+    const moveSpeed = Math.hypot(player.vx, player.vz);
+    const moveScale = 1 + Math.min(0.5, (moveSpeed / MOVE.maxSpeed) * 0.5);
+    const spread = baseSpread * adsScale * moveScale;
+
     const aimX = player.aimX + (Math.random() - 0.5) * spread;
     const aimY = player.aimY + (Math.random() - 0.5) * spread;
     const aimZ = player.aimZ + (Math.random() - 0.5) * spread;
 
-    // Normalize aim direction
     const aimLength = Math.sqrt(aimX * aimX + aimY * aimY + aimZ * aimZ);
     if (aimLength < 1e-5) {
       return;
@@ -972,7 +1031,6 @@ export class Room {
     const dirY = aimY / aimLength;
     const dirZ = aimZ / aimLength;
 
-    // Compute muzzle origin offset once so ray + visuals align
     let muzzleOffsetX = 0;
     let muzzleOffsetZ = 0;
     const planarLen = Math.hypot(dirX, dirZ);
@@ -991,41 +1049,26 @@ export class Room {
     const originY = player.y + PLAYER_EYE_HEIGHT;
     const originZ = player.z + muzzleOffsetZ;
 
-    // Check all mobs for hits using proper raycasting
-    let closestHit: { mob: Mob, distance: number } | null = null;
+    let closestHit: { mob: Mob, distance: number, rayOff: number } | null = null;
 
     for (const mob of this.mobs.values()) {
-      // Vector from muzzle to mob center
       const toMobX = mob.x - originX;
       const toMobY = mob.y - originY;
       const toMobZ = mob.z - originZ;
-
-      // Distance to mob
       const distance = Math.sqrt(toMobX * toMobX + toMobY * toMobY + toMobZ * toMobZ);
-
-      // Check if within weapon range
       if (distance > player.equipped.range) continue;
 
-      // Project mob position onto aim ray
       const dot = toMobX * dirX + toMobY * dirY + toMobZ * dirZ;
-
-      // If behind player, skip
       if (dot < 0) continue;
 
-      // Find closest point on ray to mob center
       const closestPointX = originX + dirX * dot;
       const closestPointY = originY + dirY * dot;
       const closestPointZ = originZ + dirZ * dot;
 
-      // Distance from ray to mob center (for hit detection)
-      const rayDistX = mob.x - closestPointX;
-      const rayDistY = mob.y - closestPointY;
-      const rayDistZ = mob.z - closestPointZ;
-      const rayDist = Math.sqrt(rayDistX * rayDistX + rayDistY * rayDistY + rayDistZ * rayDistZ);
+      const rayDist = Math.hypot(mob.x - closestPointX, mob.y - closestPointY, mob.z - closestPointZ);
 
-      // Check if ray passes close enough to mob (increased hitbox for better hit detection)
-      let hitboxRadius = 0.8; // Default hitbox
-      switch(mob.type) {
+      let hitboxRadius = 0.8;
+      switch (mob.type) {
         case 'tank': hitboxRadius = 1.2; break;
         case 'charger': hitboxRadius = 0.9; break;
         case 'jumper': hitboxRadius = 0.8; break;
@@ -1033,16 +1076,15 @@ export class Room {
         case 'sniper': hitboxRadius = 0.7; break;
         case 'shooter': hitboxRadius = 0.8; break;
       }
-      
+
       if (rayDist <= hitboxRadius) {
         if (!closestHit || distance < closestHit.distance) {
-          closestHit = { mob, distance };
+          closestHit = { mob, distance, rayOff: rayDist };
         }
       }
     }
 
-    // Check other players for hits
-    let closestPlayerHit: { player: Player, distance: number, hitX: number, hitY: number, hitZ: number } | null = null;
+    let closestPlayerHit: { player: Player, distance: number, hitX: number, hitY: number, hitZ: number, rayOff: number } | null = null;
     for (const target of this.players.values()) {
       if (target.id === player.id) continue;
       if (target.isDead) continue;
@@ -1077,35 +1119,44 @@ export class Room {
             distance,
             hitX: closestX,
             hitY: closestY,
-            hitZ: closestZ
+            hitZ: closestZ,
+            rayOff: rayDistance
           };
         }
       }
     }
 
+    const basePerShot = player.equipped.dps / player.equipped.fireRate;
+
+    // Helper: precision crit if ray offset is very small or long-range tight shot while ADS
+    const computeCrit = (distance: number, rayOff: number, baseRadius: number) => {
+      const tight = rayOff <= baseRadius * 0.45;
+      const longTight = player.ads && distance > 18 && rayOff <= baseRadius * 0.6;
+      return tight || longTight;
+    };
+
     let hitSomething = false;
 
     if (closestPlayerHit && (!closestHit || closestPlayerHit.distance <= closestHit.distance)) {
       const targetPlayer = closestPlayerHit.player;
-      const baseDamage = player.equipped.dps / player.equipped.fireRate;
       const falloff = Math.max(0.5, 1 - (closestPlayerHit.distance / player.equipped.range) * 0.5);
-      const damage = Math.floor(baseDamage * falloff * (0.9 + Math.random() * 0.2));
-      const isCrit = Math.random() < 0.15;
-      const finalDamage = isCrit ? damage * 2 : damage;
+      const isCrit = computeCrit(closestPlayerHit.distance, closestPlayerHit.rayOff, 0.6);
+      const critMul = isCrit ? 2.2 : 1.0;
+      const damage = Math.floor(basePerShot * falloff * critMul * (0.9 + Math.random() * 0.2));
 
       if (!targetPlayer.invulnerable && !targetPlayer.isDead) {
-        targetPlayer.hp = Math.max(0, targetPlayer.hp - finalDamage);
+        targetPlayer.hp = Math.max(0, targetPlayer.hp - damage);
 
         this.broadcast({
           type: "event",
           event: "hit",
           sourceId: player.id,
           targetId: targetPlayer.id,
-          damage: finalDamage,
+          damage,
           crit: isCrit,
-          x: targetPlayer.x,
-          y: targetPlayer.y + 1,
-          z: targetPlayer.z,
+          x: closestPlayerHit.hitX,
+          y: closestPlayerHit.hitY,
+          z: closestPlayerHit.hitZ,
           targetType: 'player'
         });
 
@@ -1113,7 +1164,7 @@ export class Room {
           type: "event",
           event: "damage",
           targetId: targetPlayer.id,
-          damage: finalDamage,
+          damage,
           sourceId: player.id
         });
 
@@ -1129,22 +1180,31 @@ export class Room {
 
       hitSomething = true;
     } else if (closestHit) {
-      const { mob, distance } = closestHit;
-
-      const baseDamage = player.equipped.dps / player.equipped.fireRate;
+      const { mob, distance, rayOff } = closestHit;
       const falloff = Math.max(0.5, 1 - (distance / player.equipped.range) * 0.5);
-      const damage = Math.floor(baseDamage * falloff * (0.9 + Math.random() * 0.2));
-      const isCrit = Math.random() < 0.15;
-      const finalDamage = isCrit ? damage * 2 : damage;
+      const baseRadius = (() => {
+        switch (mob.type) {
+          case 'tank': return 1.2;
+          case 'charger': return 0.9;
+          case 'jumper': return 0.8;
+          case 'swarm': return 0.6;
+          case 'sniper': return 0.7;
+          case 'shooter': return 0.8;
+          default: return 0.8;
+        }
+      })();
+      const isCrit = computeCrit(distance, rayOff, baseRadius);
+      const critMul = isCrit ? 2.0 : 1.0;
+      const damage = Math.floor(basePerShot * falloff * critMul * (0.9 + Math.random() * 0.2));
 
-      mob.hp = Math.max(0, mob.hp - finalDamage);
+      mob.hp = Math.max(0, mob.hp - damage);
 
       this.broadcast({
         type: "event",
         event: "hit",
         sourceId: player.id,
         targetId: mob.id,
-        damage: finalDamage,
+        damage,
         crit: isCrit,
         x: mob.x,
         y: mob.y,
@@ -1163,7 +1223,6 @@ export class Room {
       hitSomething = true;
     }
 
-    // Broadcast shot event for visual effects
     this.broadcast({
       type: "event",
       event: "shot",
@@ -1284,6 +1343,8 @@ type Player = {
   isDead?: boolean;
   invulnerable?: boolean;
   invulnerableUntil?: number;
+  ads?: boolean;             // NEW: aim-down-sights state
+  lastDamageAt?: number;     // NEW: short hit cooldown timestamp
 };
 
 type Mob = {

@@ -69,11 +69,11 @@ function requireAdmin(request: Request, env: Env): Response | null {
 
 function escapeHtml(value: unknown): string {
   return String(value ?? '')
-    .replace(/&/g, '&')
-    .replace(/</g, '<')
-    .replace(/>/g, '>')
-    .replace(/"/g, '"')
-    .replace(/'/g, ''');
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 const SUMMARY_WINDOW_SECONDS = 6 * 3600;
@@ -915,6 +915,27 @@ export default {
         status: 200,
         headers
       });
+    }
+
+    // Admin endpoint to manually trigger analytics report
+    if (url.pathname === '/admin/analytics-report' && req.method === 'POST') {
+      const authHeader = req.headers.get('Authorization');
+      const expectedAuth = `Bearer ${env.ADMIN_PASSWORD}`;
+
+      if (authHeader !== expectedAuth) {
+        return new Response('Unauthorized', {
+          status: 401,
+          headers: { 'WWW-Authenticate': 'Bearer realm="Admin"' }
+        });
+      }
+
+      try {
+        await sendSummaryToSlack(env);
+        return new Response('Analytics report sent to Slack', { status: 200 });
+      } catch (error) {
+        console.error('Failed to send analytics report:', error);
+        return new Response('Failed to send analytics report', { status: 500 });
+      }
     }
 
     if (url.pathname.startsWith("/rooms/")) {

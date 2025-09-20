@@ -15,6 +15,57 @@ export interface TerrainSample {
   moisture: number;
 }
 
+export type BlockType = 'grass' | 'dirt' | 'stone' | 'sand' | 'snow' | 'clay';
+
+interface BlockDefinition {
+  top: number;
+  side: number;
+  bottom: number;
+}
+
+const blockDefinitions: Record<BlockType, BlockDefinition> = {
+grass: { top: 0x79c05a, side: 0x5a8e3a, bottom: 0x6b4a2a },
+  dirt: { top: 0x8f6b3a, side: 0x7a552b, bottom: 0x5f3d1d },
+  stone: { top: 0x8d8d8d, side: 0x767676, bottom: 0x5b5b5b },
+  sand: { top: 0xf6e9a3, side: 0xe0d18a, bottom: 0xc7b26d },
+  snow: { top: 0xffffff, side: 0xe8f6ff, bottom: 0xcbd8e6 },
+  clay: { top: 0xa2b2c4, side: 0x8c9ca9, bottom: 0x6f7c86 }
+};
+
+const blockGeometryCache = new Map<BlockType, THREE.BufferGeometry>();
+const blockMaterial = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
+
+function getBlockGeometry(type: BlockType): THREE.BufferGeometry {
+  const cached = blockGeometryCache.get(type);
+  if (cached) return cached;
+
+  const def = blockDefinitions[type];
+  const geometry = new THREE.BoxGeometry(1, 1, 1).toNonIndexed();
+  const normals = geometry.getAttribute('normal') as THREE.BufferAttribute;
+  const colorArray = new Float32Array(normals.count * 3);
+  const color = new THREE.Color();
+
+  for (let i = 0; i < normals.count; i++) {
+    const nx = normals.getX(i);
+    const ny = normals.getY(i);
+    const nz = normals.getZ(i);
+    if (ny > 0.9) {
+      color.setHex(def.top);
+    } else if (ny < -0.9) {
+      color.setHex(def.bottom);
+    } else if (nx > 0.9 || nx < -0.9 || nz > 0.9 || nz < -0.9) {
+      color.setHex(def.side);
+    } else {
+      color.setHex(def.side);
+    }
+    color.toArray(colorArray, i * 3);
+  }
+
+  geometry.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
+  blockGeometryCache.set(type, geometry);
+  return geometry;
+}
+
 const WATER_LEVEL = 2;
 let currentTerrainSeed = 1337;
 let currentTerrainDimensions = { width: 64, depth: 64 };
@@ -23,6 +74,18 @@ let currentTerrainDimensions = { width: 64, depth: 64 };
 export function getTerrainHeight(x: number, z: number): number {
   const key = `${Math.floor(x)},${Math.floor(z)}`;
   return terrainHeightMap.get(key) ?? WATER_LEVEL + 1;
+}
+
+// Place this helper near getTerrainHeight for discoverability.
+export function getTerrainNormal(x: number, z: number): THREE.Vector3 {
+  const hL = getTerrainHeight(x - 1, z);
+  const hR = getTerrainHeight(x + 1, z);
+  const hD = getTerrainHeight(x, z - 1);
+  const hU = getTerrainHeight(x, z + 1);
+  // y is scaled to bias normals upward for voxel steps
+  const n = new THREE.Vector3(hL - hR, 2, hD - hU);
+  if (n.lengthSq() < 1e-6) return new THREE.Vector3(0, 1, 0);
+  return n.normalize();
 }
 
 export function getTerrainSampleAt(x: number, z: number): TerrainSample {
@@ -55,93 +118,108 @@ export function makeChunk(scene: THREE.Scene, size = [64, 64, 16], seed = 1337) 
   terrainSamples.clear();
   obstacles.clear();
 
-  // Create instanced mesh for voxels
-  const geometry = new THREE.BoxGeometry(1, 1, 1);
-  const material = new THREE.MeshToonMaterial({
-    color: 0x88cc44,
-    emissive: 0x223311,
-    emissiveIntensity: 0.1,
-    vertexColors: true
-  });
-
-  const maxBlocks = W * H * D; // upper bound for allocation
-  const inst = new THREE.InstancedMesh(geometry, material, maxBlocks);
-  inst.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-  // Disable frustum culling to prevent terrain disappearing
-  inst.frustumCulled = false;
-  inst.receiveShadow = true;
-
-  let i = 0;
-  const matrix = new THREE.Matrix4();
-  const color = new THREE.Color();
-
-  const paletteMap: Record<BiomeType, { low: THREE.Color; high: THREE.Color }> = {
-    grassland: {
-      low: new THREE.Color(0x36692f),
-      high: new THREE.Color(0x7bd26a)
-    },
-    rocky: {
-      low: new THREE.Color(0x4a4a53),
-      high: new THREE.Color(0x9c9ca8)
-    },
-    desert: {
-      low: new THREE.Color(0xb6924c),
-      high: new THREE.Color(0xf1deb0)
-    }
+  const blockPlacements: Record<BlockType, number[]> = {
+    grass: [],
+    dirt: [],
+    stone: [],
+    sand: [],
+    snow: [],
+    clay: []
   };
 
   const waterTiles: Array<{ x: number; z: number; surfaceY: number; biome: BiomeType; moisture: number }> = [];
 
+  const chooseSurfaceBlock = (sample: TerrainSample, height: number): BlockType => {
+    if (height >= WATER_LEVEL + 6 && sample.heat < 0.45) return 'snow';
+    if (sample.biome === 'desert') return 'sand';
+    if (sample.biome === 'rocky') return 'stone';
+    if (sample.moisture > 0.78 && height <= WATER_LEVEL + 1) return 'clay';
+    return 'grass';
+  };
+
+  const chooseSoilBlock = (sample: TerrainSample): BlockType => {
+    if (sample.biome === 'desert') return 'sand';
+    if (sample.biome === 'rocky') return 'stone';
+    if (sample.moisture > 0.72 && sample.height <= WATER_LEVEL + 1) return 'clay';
+    return 'dirt';
+  };
+
+  const soilDepthForSample = (sample: TerrainSample) => {
+    if (sample.biome === 'desert') return 4;
+    if (sample.biome === 'rocky') return 2;
+    return 3 + Math.min(2, Math.floor(sample.moisture * 2));
+  };
+
   const shouldFlood = (x: number, z: number, sample: TerrainSample) => {
+    if (sample.height <= WATER_LEVEL) return true;
     if (sample.biome === 'desert') return false;
     if (sample.moisture < 0.72) return false;
-    if (sample.height > WATER_LEVEL + 1) return false;
+    if (sample.height > WATER_LEVEL + 1.2) return false;
     const noise = valueNoise2D((x + seed * 0.13) * 0.25, (z - seed * 0.17) * 0.25, seed + 909);
-    return noise > 0.35;
+    return noise > 0.28;
   };
 
   for (let x = 0; x < W; x++) {
     for (let z = 0; z < H; z++) {
       const key = `${x},${z}`;
       const sample = getTerrainSampleAt(x, z);
-      const { height: yTop, biome, moisture } = sample;
-      terrainHeightMap.set(key, yTop);
-      const palette = paletteMap[biome];
+      let columnHeight = Math.max(2, Math.min(D - 1, Math.round(sample.height)));
+      const surfaceBlock = chooseSurfaceBlock(sample, columnHeight);
+      const soilDepth = soilDepthForSample(sample);
+
+      terrainHeightMap.set(key, columnHeight);
 
       if (shouldFlood(x, z, sample)) {
-        const surfaceY = Math.max(sample.height - 0.4, 0.1);
-        waterTiles.push({ x, z, surfaceY, biome, moisture });
+        const surfaceY = Math.max(columnHeight - 0.4, 0.1);
+        waterTiles.push({ x, z, surfaceY, biome: sample.biome, moisture: sample.moisture });
       }
 
-      for (let y = 0; y < yTop; y++) {
-        matrix.makeTranslation(x, y, z);
-        inst.setMatrixAt(i, matrix);
-
-        const layerFactor = yTop <= 1 ? 0 : y / Math.max(1, yTop - 1);
-        const jitter = valueNoise2D((x + z * 0.37) * 0.3, (z - x * 0.41) * 0.3, seed + 555);
-        const variance = valueNoise2D((x + y * 0.23) * 0.5, (z - y * 0.19) * 0.5, seed + 777);
-        color.copy(palette.low).lerp(palette.high, layerFactor);
-        color.offsetHSL((variance - 0.5) * 0.05, (variance - 0.5) * 0.08, (jitter - 0.5) * 0.06);
-        inst.setColorAt(i, color);
-
-        i++;
+      for (let y = 0; y < columnHeight; y++) {
+        const depthFromSurface = columnHeight - 1 - y;
+        let block: BlockType;
+        if (y === columnHeight - 1) {
+          block = surfaceBlock;
+        } else if (depthFromSurface < soilDepth) {
+          block = chooseSoilBlock(sample);
+        } else {
+          block = 'stone';
+        }
+        blockPlacements[block].push(x, y, z);
       }
     }
   }
 
-  inst.count = i;
-  inst.instanceMatrix.needsUpdate = true;
-  if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+  const chunkGroup = new THREE.Group();
+  chunkGroup.name = 'terrainChunk';
 
-  scene.add(inst);
+  const matrix = new THREE.Matrix4();
+  (Object.keys(blockPlacements) as BlockType[]).forEach(type => {
+    const positions = blockPlacements[type];
+    if (positions.length === 0) return;
 
-  // Layer water and surface set dressing before other props
+    const count = positions.length / 3;
+    const mesh = new THREE.InstancedMesh(getBlockGeometry(type), blockMaterial, count);
+    mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+    for (let i = 0; i < count; i++) {
+      const px = positions[i * 3];
+      const py = positions[i * 3 + 1];
+      const pz = positions[i * 3 + 2];
+      matrix.makeTranslation(px, py, pz);
+      mesh.setMatrixAt(i, matrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.frustumCulled = false;
+    chunkGroup.add(mesh);
+  });
+
+  scene.add(chunkGroup);
+
   addWaterFeatures(scene, waterTiles, rng);
-
-  // Add purposeful landmarks and cover around the map
   addDecorations(scene, rng, W, H, getTerrainSampleAt, waterTiles);
 
-  return inst;
+  return chunkGroup;
 }
 
 function addWaterFeatures(
@@ -153,59 +231,49 @@ function addWaterFeatures(
     return;
   }
 
-  const waterGeometry = new THREE.PlaneGeometry(1.05, 1.05);
+  const waterGeometry = new THREE.BoxGeometry(1, 0.7, 1);
   const waterMaterial = new THREE.MeshPhysicalMaterial({
-    color: 0x2f6cb3,
-    roughness: 0.08,
-    metalness: 0.2,
+    color: 0x3daef5,
+    roughness: 0.04,
+    metalness: 0.15,
     transparent: true,
-    opacity: 0.72,
+    opacity: 0.82,
     depthWrite: false,
-    side: THREE.DoubleSide
+    transmission: 0.55,
+    clearcoat: 0.3,
+    clearcoatRoughness: 0.1
   });
 
   const instanced = new THREE.InstancedMesh(waterGeometry, waterMaterial, waterTiles.length);
   instanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   instanced.frustumCulled = false;
   instanced.renderOrder = 2;
+  instanced.castShadow = false;
+  instanced.receiveShadow = false;
 
   const matrix = new THREE.Matrix4();
-  const quaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0));
-  const scale = new THREE.Vector3(1.05, 1, 1.05);
-  const position = new THREE.Vector3();
 
   waterTiles.forEach((tile, index) => {
-    position.set(tile.x, tile.surfaceY, tile.z);
-    matrix.compose(position, quaternion, scale);
+    const centerY = tile.surfaceY - 0.35;
+    matrix.makeTranslation(tile.x, centerY, tile.z);
     instanced.setMatrixAt(index, matrix);
   });
 
   instanced.instanceMatrix.needsUpdate = true;
   scene.add(instanced);
 
-  // Sprinkle a few bright lily pads for readability in larger pools
   if (waterTiles.length > 8) {
-    const padGeometry = new THREE.CircleGeometry(0.32, 16);
-    const padMaterial = new THREE.MeshToonMaterial({
-      color: 0x6dd39b,
-      emissive: 0x245e3f,
-      emissiveIntensity: 0.25,
-      side: THREE.DoubleSide
-    });
-
-    const padQuaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(-Math.PI / 2, 0, 0));
+    const padGeometry = new THREE.BoxGeometry(0.8, 0.08, 0.8);
+    const padMaterial = new THREE.MeshLambertMaterial({ color: 0x5daf4c });
     const lilyCount = Math.min(6, Math.floor(waterTiles.length * 0.05));
 
     for (let i = 0; i < lilyCount; i++) {
       const tile = waterTiles[Math.floor(rng() * waterTiles.length)];
       if (!tile) continue;
       const lily = new THREE.Mesh(padGeometry, padMaterial);
-      lily.position.set(tile.x + (rng() - 0.5) * 0.6, tile.surfaceY + 0.01, tile.z + (rng() - 0.5) * 0.6);
-      lily.quaternion.copy(padQuaternion);
-      const scale = 0.8 + rng() * 0.4;
-      lily.scale.setScalar(scale);
-      lily.receiveShadow = false;
+      lily.position.set(tile.x + (rng() - 0.5) * 0.4, tile.surfaceY + 0.02, tile.z + (rng() - 0.5) * 0.4);
       lily.castShadow = false;
+      lily.receiveShadow = false;
       scene.add(lily);
     }
   }
@@ -223,71 +291,27 @@ function addDecorations(
   let featureId = 0;
   const waterCoordinateSet = new Set<string>(waterTiles.map(tile => `${tile.x},${tile.z}`));
 
-  const treeTrunkMaterial = new THREE.MeshToonMaterial({
-    color: 0x5b3a1f,
-    emissive: 0x1d1208,
-    emissiveIntensity: 0.08
-  });
-  const treeCanopyMaterial = new THREE.MeshToonMaterial({
-    color: 0x3c7a32,
-    emissive: 0x1a3d17,
-    emissiveIntensity: 0.12
-  });
-  const rockMaterial = new THREE.MeshToonMaterial({
-    color: 0x5f5f69,
-    emissive: 0x1c1c21,
-    emissiveIntensity: 0.1
-  });
-  const cactusMaterial = new THREE.MeshToonMaterial({
-    color: 0x2c8f4a,
-    emissive: 0x0f3b1a,
-    emissiveIntensity: 0.12
-  });
-  const crateMaterial = new THREE.MeshToonMaterial({
-    color: 0x8b5a2b,
-    emissive: 0x352112,
-    emissiveIntensity: 0.12
-  });
-  const barrelMaterial = new THREE.MeshToonMaterial({
-    color: 0xad1a1a,
-    emissive: 0x400808,
-    emissiveIntensity: 0.2
-  });
-  const coverMaterial = new THREE.MeshToonMaterial({
-    color: 0x5b4633,
-    emissive: 0x1f140c,
-    emissiveIntensity: 0.08
-  });
-  const reedMaterial = new THREE.MeshToonMaterial({
-    color: 0x3c9150,
-    emissive: 0x12321a,
-    emissiveIntensity: 0.12
-  });
-  const reedBloomMaterial = new THREE.MeshToonMaterial({
-    color: 0xd3a15e,
-    emissive: 0x4d2b0d,
-    emissiveIntensity: 0.16
-  });
-  const dockDeckMaterial = new THREE.MeshToonMaterial({
-    color: 0x6f4f32,
-    emissive: 0x23160a,
-    emissiveIntensity: 0.08
-  });
-  const dockRailMaterial = new THREE.MeshToonMaterial({
-    color: 0x9d6f3a,
-    emissive: 0x3a2813,
-    emissiveIntensity: 0.12
-  });
+  const treeTrunkMaterial = new THREE.MeshLambertMaterial({ color: 0x80502a });
+  const treeCanopyMaterial = new THREE.MeshLambertMaterial({ color: 0x3fa34d });
+  const rockMaterial = new THREE.MeshLambertMaterial({ color: 0x8c8c8c });
+  const cactusMaterial = new THREE.MeshLambertMaterial({ color: 0x3fa061 });
+  const crateMaterial = new THREE.MeshLambertMaterial({ color: 0x9c6d3a });
+  const barrelMaterial = new THREE.MeshLambertMaterial({ color: 0xb74f2e });
+  const coverMaterial = new THREE.MeshLambertMaterial({ color: 0x7a5a3a });
+  const reedMaterial = new THREE.MeshLambertMaterial({ color: 0x56b46c });
+  const reedBloomMaterial = new THREE.MeshLambertMaterial({ color: 0xe7c07c });
+  const dockDeckMaterial = new THREE.MeshLambertMaterial({ color: 0x9a6d3b });
+  const dockRailMaterial = new THREE.MeshLambertMaterial({ color: 0xc18a4a });
 
   const pathGeometry = new THREE.BoxGeometry(3.2, 0.25, 5.2);
   const platformGeometry = new THREE.BoxGeometry(8.2, 0.4, 8.2);
   const crateGeometry = new THREE.BoxGeometry(1.4, 1.4, 1.4);
-  const barrelGeometry = new THREE.CylinderGeometry(0.8, 0.9, 1.6, 10);
-  const reedGeometry = new THREE.CylinderGeometry(0.05, 0.08, 1.4, 6);
-  const reedBloomGeometry = new THREE.SphereGeometry(0.08, 6, 6);
+  const barrelGeometry = new THREE.BoxGeometry(1.1, 1.4, 1.1);
+  const reedGeometry = new THREE.BoxGeometry(0.12, 1.4, 0.12);
+  const reedBloomGeometry = new THREE.BoxGeometry(0.24, 0.24, 0.24);
   const dockPlankGeometry = new THREE.BoxGeometry(1.3, 0.18, 1.5);
-  const dockPostGeometry = new THREE.CylinderGeometry(0.12, 0.14, 0.9, 6);
-  const dockRailBeamGeometry = new THREE.BoxGeometry(1.3, 0.12, 0.08);
+  const dockPostGeometry = new THREE.BoxGeometry(0.28, 0.9, 0.28);
+  const dockRailBeamGeometry = new THREE.BoxGeometry(1.3, 0.18, 0.18);
 
   createGuidingPath();
   spawnTreeClusters();
@@ -365,49 +389,60 @@ function addDecorations(
 
   function createTree(scale: number) {
     const group = new THREE.Group();
-    const trunkHeight = 1.6 * scale + 0.8;
-    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.18 * scale, 0.26 * scale, trunkHeight, 6), treeTrunkMaterial);
+    const trunkHeight = Math.max(3, Math.round(3 * scale));
+    const trunk = new THREE.Mesh(new THREE.BoxGeometry(0.7, trunkHeight, 0.7), treeTrunkMaterial);
     trunk.position.y = trunkHeight * 0.5;
     group.add(trunk);
 
-    const canopyMain = new THREE.Mesh(new THREE.SphereGeometry(0.9 * scale + 0.2, 10, 10), treeCanopyMaterial);
-    canopyMain.position.y = trunkHeight;
-    group.add(canopyMain);
+    const canopySize = Math.max(3, Math.round(2 * scale) + 2);
+    const canopyGeometry = new THREE.BoxGeometry(canopySize, canopySize, canopySize);
+    const canopy = new THREE.Mesh(canopyGeometry, treeCanopyMaterial);
+    canopy.position.y = trunkHeight + canopySize * 0.5 - 0.5;
+    group.add(canopy);
 
-    const canopyAccent = new THREE.Mesh(new THREE.DodecahedronGeometry(0.65 * scale, 0), treeCanopyMaterial);
-    canopyAccent.position.set(0.3 * scale, trunkHeight + 0.5 * scale, 0.25 * scale);
-    group.add(canopyAccent);
+    const crossGeometry = new THREE.BoxGeometry(canopySize + 1, canopySize - 1, 1);
+    const crossA = new THREE.Mesh(crossGeometry, treeCanopyMaterial);
+    crossA.position.y = canopy.position.y;
+    group.add(crossA);
+    const crossB = crossA.clone();
+    crossB.rotation.y = Math.PI / 2;
+    group.add(crossB);
 
     return group;
   }
 
   function createRock(scale: number) {
     const group = new THREE.Group();
-    const geom = new THREE.DodecahedronGeometry(0.9 * scale, 0);
-    const mat = rockMaterial.clone() as THREE.MeshToonMaterial;
-    mat.color = mat.color.clone();
-    mat.color.offsetHSL((rng() - 0.5) * 0.04, (rng() - 0.5) * 0.08, (rng() - 0.5) * 0.1);
-    const rockMesh = new THREE.Mesh(geom, mat);
-    rockMesh.rotation.set(rng() * Math.PI, rng() * Math.PI, rng() * Math.PI);
-    rockMesh.position.y = 0.6 * scale;
-    group.add(rockMesh);
+    const base = new THREE.Mesh(new THREE.BoxGeometry(1.1 * scale, 0.6 * scale, 1.1 * scale), rockMaterial.clone());
+    base.position.y = 0.3 * scale;
+    base.rotation.y = rng() * Math.PI;
+    group.add(base);
+
+    const cap = new THREE.Mesh(new THREE.BoxGeometry(0.8 * scale, 0.45 * scale, 0.8 * scale), rockMaterial.clone());
+    cap.position.set((rng() - 0.5) * 0.4 * scale, 0.75 * scale, (rng() - 0.5) * 0.4 * scale);
+    cap.rotation.y = rng() * Math.PI;
+    group.add(cap);
+
     return group;
   }
 
   function createCactus(scale: number) {
     const group = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.25 * scale, 0.3 * scale, 1.9 * scale, 8), cactusMaterial);
-    body.position.y = 0.95 * scale;
+    const height = Math.max(3, Math.round(2.2 * scale));
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.8, height, 0.8), cactusMaterial);
+    body.position.y = height * 0.5;
     group.add(body);
 
-    const armGeometry = new THREE.CylinderGeometry(0.12 * scale, 0.12 * scale, 0.8 * scale, 8);
-    const leftArm = new THREE.Mesh(armGeometry, cactusMaterial);
-    leftArm.rotation.z = Math.PI / 2;
-    leftArm.position.set(0.35 * scale, 1.1 * scale, 0);
-    group.add(leftArm);
-    const rightArm = leftArm.clone();
-    rightArm.position.x = -0.35 * scale;
-    group.add(rightArm);
+    if (scale > 0.9) {
+      const armHeight = Math.max(2, Math.round(1.4 * scale));
+      const armGeometry = new THREE.BoxGeometry(0.5, armHeight, 0.5);
+      const leftArm = new THREE.Mesh(armGeometry, cactusMaterial);
+      leftArm.position.set(0.65, height * 0.6, 0);
+      group.add(leftArm);
+      const rightArm = leftArm.clone();
+      rightArm.position.x = -0.65;
+      group.add(rightArm);
+    }
 
     return group;
   }
@@ -421,7 +456,7 @@ function addDecorations(
 
   function createBarrel() {
     const barrel = new THREE.Mesh(barrelGeometry, barrelMaterial);
-    barrel.position.y = 0.75;
+    barrel.position.y = 0.7;
     return barrel;
   }
 
@@ -512,7 +547,7 @@ function addDecorations(
   }
 
   function createGuidingPath() {
-    const pathMaterial = coverMaterial.clone() as THREE.MeshToonMaterial;
+    const pathMaterial = coverMaterial.clone() as THREE.MeshLambertMaterial;
     pathMaterial.color = pathMaterial.color.clone();
     pathMaterial.color.offsetHSL(-0.05, -0.1, -0.08);
 
@@ -702,11 +737,7 @@ function addDecorations(
     if (anchorSample.height <= WATER_LEVEL + 1) return;
     if (!reserve(anchorX, anchorZ, 5)) return;
 
-    const platformMaterial = new THREE.MeshToonMaterial({
-      color: 0x705434,
-      emissive: 0x261a0c,
-      emissiveIntensity: 0.1
-    });
+    const platformMaterial = new THREE.MeshLambertMaterial({ color: 0x8f6a3c });
 
     const platform = new THREE.Mesh(platformGeometry, platformMaterial);
     platform.position.set(anchorX, anchorSample.height + 0.2, anchorZ);
@@ -777,16 +808,8 @@ function addDecorations(
 
     const tower = new THREE.Group();
     const legGeometry = new THREE.CylinderGeometry(0.25, 0.32, 6.6, 8);
-    const legMaterial = new THREE.MeshToonMaterial({
-      color: 0x5d4732,
-      emissive: 0x22170d,
-      emissiveIntensity: 0.1
-    });
-    const deckMaterial = new THREE.MeshToonMaterial({
-      color: 0x907a5c,
-      emissive: 0x362918,
-      emissiveIntensity: 0.1
-    });
+    const legMaterial = new THREE.MeshLambertMaterial({ color: 0x7c5c34 });
+    const deckMaterial = new THREE.MeshLambertMaterial({ color: 0xb08b57 });
 
     const legOffsets: Array<[number, number]> = [
       [-1.5, -1.5],
@@ -818,7 +841,7 @@ function addDecorations(
     railZBack.position.x = -2.2;
     tower.add(railZBack);
 
-    const canopyMaterial = deckMaterial.clone() as THREE.MeshToonMaterial;
+    const canopyMaterial = deckMaterial.clone() as THREE.MeshLambertMaterial;
     canopyMaterial.color = canopyMaterial.color.clone();
     canopyMaterial.color.offsetHSL(-0.04, 0.05, -0.08);
     const canopy = new THREE.Mesh(new THREE.ConeGeometry(2.4, 1.2, 8), canopyMaterial);
@@ -840,7 +863,17 @@ function addDecorations(
 }
 
 // Create skybox with gradient
-export function makeSkybox(scene: THREE.Scene) {
+export interface SkyboxHandle {
+  mesh: THREE.Mesh;
+  uniforms: {
+    topColor: { value: THREE.Color };
+    bottomColor: { value: THREE.Color };
+    offset: { value: number };
+    exponent: { value: number };
+  };
+}
+
+export function makeSkybox(scene: THREE.Scene): SkyboxHandle {
   const vertexShader = `
     varying vec3 vWorldPosition;
     void main() {
@@ -864,22 +897,24 @@ export function makeSkybox(scene: THREE.Scene) {
   `;
 
   const uniforms = {
-    topColor: { value: new THREE.Color(0x88ccff) },
-    bottomColor: { value: new THREE.Color(0xffaa66) },
+    topColor: { value: new THREE.Color(0x87cfff) },
+    bottomColor: { value: new THREE.Color(0xf6d7a7) },
     offset: { value: 33 },
     exponent: { value: 0.6 }
   };
 
   const skyGeo = new THREE.SphereGeometry(400, 32, 15);
   const skyMat = new THREE.ShaderMaterial({
-    uniforms: uniforms,
-    vertexShader: vertexShader,
-    fragmentShader: fragmentShader,
+    uniforms,
+    vertexShader,
+    fragmentShader,
     side: THREE.BackSide
   });
 
   const sky = new THREE.Mesh(skyGeo, skyMat);
   scene.add(sky);
+
+  return { mesh: sky, uniforms };
 }
 
 // Seeded random number generator
@@ -914,7 +949,7 @@ function computeTerrainSample(
   const rolling = fbm(x, z, seed + 404, 0.08, 3, 0.6, 2.1);
   const plateaus = fbm(x, z, seed + 505, 0.02, 2, 0.5, 2.0);
 
-  let height = 3 + ridges * 2.2 + rolling * 1.4 + plateaus * 1.2;
+  let height = 5 + ridges * 6.0 + rolling * 3.0 + plateaus * 2.5;
 
   const centerX = width / 2;
   const centerZ = depth / 2;
@@ -936,8 +971,8 @@ function computeTerrainSample(
     height -= wetland * 2.2;
   }
 
-  if (height < 1.2) height = 1.2;
-  const quantized = Math.max(1, Math.round(height));
+  if (height < 2) height = 2;
+  const quantized = Math.max(2, Math.round(height));
 
   return {
     height: quantized,

@@ -1,6 +1,6 @@
 // ... existing imports ...
 import * as THREE from 'three';
-import { makeChunk, makeSkybox, getTerrainHeight, obstacles } from './world';
+import { makeChunk, makeSkybox, getTerrainHeight, getTerrainNormal, obstacles } from './world';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass';
@@ -13,6 +13,11 @@ let ws: WebSocket;
 let isSpectator = false;
 let spectatorUntil = 0;
 
+let isADS = false;
+const BASE_FOV = 60;
+const ADS_FOV = 42;
+let targetFov = BASE_FOV;
+let recoilKick = 0; // transient pitch kick after shots
 const API_BASE =
   (import.meta.env.VITE_API_BASE as string | undefined) ??
   (import.meta.env.DEV ? 'http://localhost:8787' : 'https://borderboxes-api.highfive.workers.dev');
@@ -360,6 +365,11 @@ let perfAccumMS = 0;
 let outlineThrottle = 0;
 let lastDamageTime = 0;
 
+const outlineScratch = {
+  forward: new THREE.Vector3(),
+  toMob: new THREE.Vector3()
+};
+
 function buildComposer() {
   composer = new EffectComposer(renderer);
   const renderPass = new RenderPass(scene, camera);
@@ -370,10 +380,12 @@ function buildComposer() {
     scene,
     camera
   );
-  outlinePass.edgeStrength = 2;
-  outlinePass.edgeGlow = 0;
-  outlinePass.edgeThickness = 1;
+  outlinePass.edgeStrength = 3.8;
+  outlinePass.edgeGlow = 0.55;
+  outlinePass.edgeThickness = 2.2;
   outlinePass.pulsePeriod = 0;
+  (outlinePass as any).visibleEdgeColor?.set?.(0xffffff);
+  (outlinePass as any).hiddenEdgeColor?.set?.(0x101820);
   composer.addPass(outlinePass);
 
   fxaaPass = new ShaderPass(FXAAShader);
@@ -459,38 +471,286 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.2;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMappingExposure = 4.2;
 applyPixelRatio();
 
 // Setup scene
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(0x88aacc, 50, 300);
+scene.fog = new THREE.Fog(0xcfe8ff, 220, 820);
 
 // Setup camera
 const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 500);
 camera.position.set(32, 20, 48);
 
-// Lighting
-const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
-dirLight.position.set(30, 50, 20);
-dirLight.castShadow = true;
-dirLight.shadow.camera.left = -30;
-dirLight.shadow.camera.right = 30;
-dirLight.shadow.camera.top = 30;
-dirLight.shadow.camera.bottom = -30;
-dirLight.shadow.camera.near = 0.1;
-dirLight.shadow.camera.far = 100;
-dirLight.shadow.mapSize.width = 1024; // Reduced for performance
-dirLight.shadow.mapSize.height = 1024;
-dirLight.shadow.bias = -0.001;
-scene.add(dirLight);
+const damageIndicatorScratch = {
+  toTarget: new THREE.Vector3(),
+  forward: new THREE.Vector3(),
+  right: new THREE.Vector3(),
+  source: new THREE.Vector3()
+};
 
-const ambLight = new THREE.AmbientLight(0x4466aa, 0.4);
+let damageIndicatorElement: HTMLDivElement | null = null;
+let damageIndicatorFadeTimeout: number | null = null;
+let damageIndicatorHideTimeout: number | null = null;
+
+function ensureDamageIndicatorElements() {
+  if (damageIndicatorElement) return;
+
+  const indicator = document.createElement('div');
+  indicator.style.position = 'fixed';
+  indicator.style.top = '50%';
+  indicator.style.left = '50%';
+  indicator.style.width = '84px';
+  indicator.style.height = '84px';
+  indicator.style.pointerEvents = 'none';
+  indicator.style.opacity = '0';
+  indicator.style.zIndex = '1000';
+  indicator.style.display = 'none';
+  indicator.style.transform = 'translate(-50%, -50%)';
+  indicator.style.transition = 'opacity 0.12s ease-out';
+
+  const ring = document.createElement('div');
+  ring.style.position = 'absolute';
+  ring.style.top = '0';
+  ring.style.left = '0';
+  ring.style.width = '100%';
+  ring.style.height = '100%';
+  ring.style.border = '4px solid rgba(255, 120, 120, 0.85)';
+  ring.style.borderRadius = '50%';
+  ring.style.boxShadow = '0 0 16px rgba(255, 90, 90, 0.65)';
+  indicator.appendChild(ring);
+
+  const arrow = document.createElement('div');
+  arrow.style.position = 'absolute';
+  arrow.style.top = '-18px';
+  arrow.style.left = '50%';
+  arrow.style.transform = 'translateX(-50%)';
+  arrow.style.width = '0';
+  arrow.style.height = '0';
+  arrow.style.borderLeft = '12px solid transparent';
+  arrow.style.borderRight = '12px solid transparent';
+  arrow.style.borderBottom = '20px solid rgba(255, 120, 120, 0.95)';
+  indicator.appendChild(arrow);
+
+  (document.body ?? document.documentElement).appendChild(indicator);
+  damageIndicatorElement = indicator;
+}
+
+function showDamageIndicator(sourcePosition: THREE.Vector3) {
+  ensureDamageIndicatorElements();
+  if (!damageIndicatorElement) return;
+
+  const { toTarget, forward, right } = damageIndicatorScratch;
+  toTarget.copy(sourcePosition).sub(camera.position);
+  toTarget.y = 0;
+  if (toTarget.lengthSq() < 0.0001) return;
+
+  forward.set(0, 0, -1).applyQuaternion(camera.quaternion);
+  forward.y = 0;
+  if (forward.lengthSq() < 0.0001) return;
+  forward.normalize();
+
+  right.set(1, 0, 0).applyQuaternion(camera.quaternion);
+  right.y = 0;
+  if (right.lengthSq() < 0.0001) return;
+  right.normalize();
+
+  const forwardProj = toTarget.dot(forward);
+  const rightProj = toTarget.dot(right);
+  if (forwardProj === 0 && rightProj === 0) return;
+
+  const angle = Math.atan2(rightProj, forwardProj);
+
+  damageIndicatorElement.style.display = 'block';
+  damageIndicatorElement.style.transform = `translate(-50%, -50%) rotate(${angle}rad)`;
+  damageIndicatorElement.style.opacity = '0.85';
+
+  if (damageIndicatorFadeTimeout !== null) {
+    window.clearTimeout(damageIndicatorFadeTimeout);
+    damageIndicatorFadeTimeout = null;
+  }
+  if (damageIndicatorHideTimeout !== null) {
+    window.clearTimeout(damageIndicatorHideTimeout);
+    damageIndicatorHideTimeout = null;
+  }
+
+  damageIndicatorFadeTimeout = window.setTimeout(() => {
+    if (!damageIndicatorElement) return;
+    damageIndicatorElement.style.opacity = '0';
+    damageIndicatorHideTimeout = window.setTimeout(() => {
+      if (damageIndicatorElement) {
+        damageIndicatorElement.style.display = 'none';
+      }
+      damageIndicatorHideTimeout = null;
+    }, 220);
+    damageIndicatorFadeTimeout = null;
+  }, 520);
+}
+
+// Lighting
+const dirLight = new THREE.DirectionalLight(0xfff6d3, 4.5);
+dirLight.position.set(32, 72, 12);
+dirLight.castShadow = true;
+dirLight.shadow.camera.left = -40;
+dirLight.shadow.camera.right = 40;
+dirLight.shadow.camera.top = 40;
+dirLight.shadow.camera.bottom = -40;
+dirLight.shadow.camera.near = 0.1;
+dirLight.shadow.camera.far = 160;
+dirLight.shadow.mapSize.width = 1536;
+dirLight.shadow.mapSize.height = 1536;
+dirLight.shadow.bias = -0.0008;
+scene.add(dirLight);
+dirLight.target.position.set(32, 0, 32);
+scene.add(dirLight.target);
+
+const ambLight = new THREE.AmbientLight(0xfff3d0, 1.9);
 scene.add(ambLight);
 
+const hemiLight = new THREE.HemisphereLight(0xf2f8ff, 0x8b6a42, 1.6);
+scene.add(hemiLight);
+
+const fillLight = new THREE.DirectionalLight(0xcfe3ff, 1.2);
+fillLight.position.set(-54, 48, -36);
+fillLight.castShadow = false;
+scene.add(fillLight);
+
 // Create world
-makeSkybox(scene);
+const skybox = makeSkybox(scene);
 makeChunk(scene, [64, 64, 16], 1337);
+
+const DAY_LENGTH_MS = 600000; // 10 minutes instead of 3
+let timeOfDayMs = DAY_LENGTH_MS * 0.25;
+const sunOrbitRadius = 140;
+const mapCenter = new THREE.Vector3(32, 0, 32);
+
+// Clamp lighting parameters so the scene never drops below high-visibility targets.
+const VISIBILITY_DAYLIGHT_FLOOR = 0.65;
+const VISIBILITY_AMBIENT_FLOOR = 2.0;
+const VISIBILITY_HEMI_FLOOR = 1.9;
+const VISIBILITY_DIRLIGHT_BASE = 4.7;
+const VISIBILITY_DIRLIGHT_PEAK = 6.3;
+const VISIBILITY_EXPOSURE_FLOOR = 4.1;
+
+const daySkyTop = new THREE.Color(0x9bd6ff);
+const daySkyBottom = new THREE.Color(0xf7e5b5);
+const nightSkyTop = new THREE.Color(0x1a314f);
+const nightSkyBottom = new THREE.Color(0x263a55);
+const dawnSkyTop = new THREE.Color(0x5362a8);
+const dawnSkyBottom = new THREE.Color(0xffa974);
+
+const sunDayColor = new THREE.Color(0xfff4cf);
+const sunNightColor = new THREE.Color(0xc9d9ff);
+const sunDawnColor = new THREE.Color(0xffc487);
+
+const ambientDayColor = new THREE.Color(0xe0edff);
+const ambientNightColor = new THREE.Color(0x354766);
+const ambientDawnColor = new THREE.Color(0xffd6a9);
+
+const hemiSkyDay = new THREE.Color(0xd6ecff);
+const hemiSkyNight = new THREE.Color(0x3b5682);
+const hemiSkyDawn = new THREE.Color(0x7a8bff);
+const hemiGroundDay = new THREE.Color(0x695536);
+const hemiGroundNight = new THREE.Color(0x2a1b12);
+const hemiGroundDawn = new THREE.Color(0x4b3723);
+
+const scratchColorA = new THREE.Color();
+const scratchColorB = new THREE.Color();
+const scratchColorC = new THREE.Color();
+const scratchColorD = new THREE.Color();
+const scratchColorE = new THREE.Color();
+
+const fillSkyColor = new THREE.Color(0xdde9ff);
+const fillWarmColor = new THREE.Color(0xfff2cc);
+
+function updateDayNight(deltaMs: number) {
+  timeOfDayMs = (timeOfDayMs + deltaMs) % DAY_LENGTH_MS;
+  const phase = timeOfDayMs / DAY_LENGTH_MS;
+  const sunAngle = phase * Math.PI * 2 - Math.PI / 2;
+  const sunHeight = Math.sin(sunAngle);
+  const daylight = THREE.MathUtils.clamp((sunHeight + 0.35) / 1.35, 0.1, 1);
+  const effectiveDaylight = Math.max(daylight, VISIBILITY_DAYLIGHT_FLOOR);
+  const twilight = 1 - THREE.MathUtils.clamp(Math.abs(sunHeight) / 0.4, 0, 1);
+  const duskGlow = Math.pow(twilight, 1.2);
+
+  const sunX = mapCenter.x + Math.cos(sunAngle) * sunOrbitRadius;
+  const sunY = THREE.MathUtils.lerp(28, 110, THREE.MathUtils.clamp((sunHeight + 1) / 2, 0, 1));
+  const sunZ = mapCenter.z + Math.sin(sunAngle) * sunOrbitRadius * 0.6;
+  dirLight.position.set(sunX, sunY, sunZ);
+  dirLight.target.position.copy(mapCenter);
+  dirLight.target.updateMatrixWorld();
+
+  const sunColor = scratchColorA.copy(sunNightColor)
+    .lerp(sunDayColor, Math.pow(daylight, 0.7))
+    .lerp(sunDawnColor, Math.min(1, duskGlow));
+  dirLight.color.copy(sunColor);
+  const baseDayStrength = THREE.MathUtils.lerp(
+    VISIBILITY_DIRLIGHT_BASE,
+    VISIBILITY_DIRLIGHT_PEAK,
+    Math.pow(effectiveDaylight, 0.7)
+  );
+  const twilightFill = Math.min(1.4, duskGlow * 1.05);
+  dirLight.intensity = Math.max(VISIBILITY_DIRLIGHT_BASE, baseDayStrength + twilightFill);
+  const targetYOffset = THREE.MathUtils.lerp(-18, -6, effectiveDaylight);
+  dirLight.target.position.set(mapCenter.x, targetYOffset, mapCenter.z);
+  dirLight.target.updateMatrixWorld();
+  dirLight.shadow.bias = -0.00085;
+
+  const fillRatio = Math.min(1, effectiveDaylight * 0.6 + duskGlow * 0.4);
+  const fillColor = scratchColorE.copy(fillSkyColor).lerp(fillWarmColor, fillRatio);
+  fillLight.color.copy(fillColor);
+  fillLight.intensity = THREE.MathUtils.lerp(0.85, 1.45, effectiveDaylight);
+
+  const ambientColor = scratchColorB.copy(ambientNightColor)
+    .lerp(ambientDayColor, daylight)
+    .lerp(ambientDawnColor, Math.min(1, duskGlow));
+  ambLight.color.copy(ambientColor);
+  ambLight.intensity = Math.max(
+    VISIBILITY_AMBIENT_FLOOR,
+    THREE.MathUtils.lerp(1.9, 2.4, effectiveDaylight) + duskGlow * 0.5
+  );
+
+  const hemiSky = scratchColorC.copy(hemiSkyNight)
+    .lerp(hemiSkyDay, daylight)
+    .lerp(hemiSkyDawn, Math.min(1, duskGlow));
+  hemiLight.color.copy(hemiSky);
+  const hemiGround = scratchColorD.copy(hemiGroundNight)
+    .lerp(hemiGroundDay, daylight)
+    .lerp(hemiGroundDawn, Math.min(1, duskGlow));
+  hemiLight.groundColor.copy(hemiGround);
+  hemiLight.intensity = Math.max(
+    VISIBILITY_HEMI_FLOOR,
+    THREE.MathUtils.lerp(1.8, 2.4, effectiveDaylight) + duskGlow * 0.4
+  );
+
+  const skyTop = scratchColorA.copy(nightSkyTop)
+    .lerp(daySkyTop, daylight)
+    .lerp(dawnSkyTop, Math.min(1, duskGlow));
+  const skyBottom = scratchColorB.copy(nightSkyBottom)
+    .lerp(daySkyBottom, daylight)
+    .lerp(dawnSkyBottom, Math.min(1, duskGlow));
+  skybox.uniforms.topColor.value.copy(skyTop);
+  skybox.uniforms.bottomColor.value.copy(skyBottom);
+  skybox.uniforms.exponent.value = THREE.MathUtils.lerp(0.75, 0.98, effectiveDaylight);
+
+  if (scene.fog) {
+    scene.fog.color.copy(skyBottom);
+    if (scene.fog instanceof THREE.Fog) {
+      scene.fog.near = THREE.MathUtils.lerp(240, 360, effectiveDaylight) + duskGlow * 60;
+      scene.fog.far = THREE.MathUtils.lerp(820, 980, effectiveDaylight) + duskGlow * 90;
+    } else if (scene.fog instanceof THREE.FogExp2) {
+      scene.fog.density = THREE.MathUtils.lerp(0.003, 0.0018, effectiveDaylight);
+    }
+  }
+
+  renderer.toneMappingExposure = Math.max(
+    VISIBILITY_EXPOSURE_FLOOR,
+    THREE.MathUtils.lerp(4.1, 4.7, effectiveDaylight) + Math.min(0.35, duskGlow * 0.2)
+  );
+}
+
+updateDayNight(0);
 
 // Post-processing for cel-shading effect (optional for performance)
 const enablePostProcessing = true; // existing config hook
@@ -556,19 +816,37 @@ const mobPalettes: Record<string, { base: number; accent: number; glow: number }
   default: { base: 0x3a3a3a, accent: 0xaaaaaa, glow: 0xffffff }
 };
 
+const MOB_BASE_SCALE: Record<string, number> = {
+  charger: 2.4,
+  shooter: 2.0,
+  jumper: 2.2,
+  sniper: 2.6,
+  tank: 2.8,
+  swarm: 1.9,
+  default: 2.1
+};
+
 const mobPrototypes = new Map<string, THREE.Group>();
+const mobFallbackPrototypes = new Map<string, THREE.Group>();
 const voxelLoader = VoxelModelLoader.getInstance();
 
 // Preload voxel models for enemies
 async function preloadEnemyModels() {
   const modelPaths = [
-    { type: 'sniper', path: '/models/enemies/sniper/mechSniper.obj', format: 'obj', scale: 0.3 },
-    { type: 'tank', path: '/models/enemies/tank/ShockTrooper.obj', format: 'obj', scale: 0.4 },
-    { type: 'shooter', path: '/models/enemies/skeletons/shooter.vox', format: 'vox', scale: 0.5 },
-    { type: 'swarm', path: '/models/enemies/skeletons/swarm.vox', format: 'vox', scale: 0.3 },
-    { type: 'charger', path: '/models/enemies/chicken/ayam.dae', format: 'dae', scale: 0.35 },
-    { type: 'jumper', path: '/models/enemies/skeletons/charger.vox', format: 'vox', scale: 0.4 }
+    { type: 'sniper', path: '/models/enemies/sniper/mechSniper.obj', format: 'obj', scale: 0.035 },
+    { type: 'tank', path: '/models/enemies/tank/ShockTrooper.obj', format: 'obj', scale: 0.04 },
+    { type: 'shooter', path: '/models/enemies/skeletons/shooter.vox', format: 'vox', scale: 0.06 },
+    { type: 'swarm', path: '/models/enemies/skeletons/swarm.vox', format: 'vox', scale: 0.05 },
+    { type: 'charger', path: '/models/enemies/chicken/ayam.dae', format: 'dae', scale: 0.045 },
+    { type: 'jumper', path: '/models/enemies/skeletons/charger.vox', format: 'vox', scale: 0.055 }
   ];
+
+  mobFallbackPrototypes.set('sniper', buildSniperPrototype());
+  mobFallbackPrototypes.set('tank', buildTankPrototype());
+  mobFallbackPrototypes.set('shooter', buildShooterPrototype());
+  mobFallbackPrototypes.set('swarm', buildSwarmPrototype());
+  mobFallbackPrototypes.set('charger', buildChargerPrototype());
+  mobFallbackPrototypes.set('jumper', buildJumperPrototype());
 
   for (const model of modelPaths) {
     try {
@@ -578,248 +856,482 @@ async function preloadEnemyModels() {
 
       // Set base scale based on enemy type
       switch(model.type) {
-        case 'sniper': group.userData.baseScale = 1.3; break;
-        case 'tank': group.userData.baseScale = 1.5; break;
-        case 'shooter': group.userData.baseScale = 1.0; break;
-        case 'swarm': group.userData.baseScale = 0.8; break;
-        case 'charger': group.userData.baseScale = 1.1; break;
-        case 'jumper': group.userData.baseScale = 1.0; break;
+        case 'sniper': group.userData.baseScale = 1.35; break;
+        case 'tank': group.userData.baseScale = 1.65; break;
+        case 'shooter': group.userData.baseScale = 1.25; break;
+        case 'swarm': group.userData.baseScale = 1.1; break;
+        case 'charger': group.userData.baseScale = 1.4; break;
+        case 'jumper': group.userData.baseScale = 1.3; break;
       }
 
+      applyMobPostProcess(group, model.type);
       mobPrototypes.set(model.type, group);
       console.log(`Loaded voxel model for ${model.type}`);
     } catch (error) {
-      console.warn(`Failed to load voxel model for ${model.type}, using procedural geometry`);
+      console.warn(`Failed to load voxel model for ${model.type}, using procedural geometry`, error);
+      const fallback = mobFallbackPrototypes.get(model.type);
+      if (fallback) {
+        mobPrototypes.set(model.type, fallback);
+      }
     }
   }
 }
 
-function clonePrototype(group: THREE.Group): THREE.Object3D {
+function applyMobPostProcess(group: THREE.Group, type: string) {
+  const tempVec = new THREE.Vector3();
+  const glowColors: Record<string, number> = {
+    charger: 0xf26d4c,
+    shooter: 0x6ad9ff,
+    jumper: 0x76ff9f,
+    sniper: 0xe2a9ff,
+    tank: 0xffd166,
+    swarm: 0xff74c6,
+    default: 0xffffff
+  };
+
+  let primaryMesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material | THREE.Material[]> | null = null;
+  let largestExtent = 0;
+
+  group.traverse(obj => {
+    if ((obj as THREE.Mesh).isMesh) {
+      const mesh = obj as THREE.Mesh;
+      const geometry = mesh.geometry as THREE.BufferGeometry | undefined;
+      if (!geometry) return;
+
+      if (Array.isArray(mesh.material)) {
+        mesh.material = mesh.material.map(mat => mat.clone());
+      } else if (mesh.material) {
+        mesh.material = (mesh.material as THREE.Material).clone();
+      }
+
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+
+      geometry.computeBoundingBox();
+      const bbox = geometry.boundingBox;
+      if (bbox) {
+        const extent = bbox.getSize(tempVec).length();
+        if (extent > largestExtent) {
+          largestExtent = extent;
+          primaryMesh = mesh;
+        }
+      }
+
+      if (mesh.material instanceof THREE.MeshStandardMaterial) {
+        const mat = mesh.material as THREE.MeshStandardMaterial;
+        if (mat.emissive.r === 0 && mat.emissive.g === 0 && mat.emissive.b === 0) {
+          mat.emissive.copy(mat.color).multiplyScalar(0.35);
+        }
+        mat.emissiveIntensity = Math.max(mat.emissiveIntensity ?? 0, 0.75);
+      } else if (mesh.material instanceof THREE.MeshToonMaterial) {
+        const mat = mesh.material as THREE.MeshToonMaterial;
+        if (mat.emissive.equals(new THREE.Color(0, 0, 0))) {
+          mat.emissive.copy(mat.color).multiplyScalar(0.35);
+        }
+        mat.emissiveIntensity = Math.max(mat.emissiveIntensity ?? 0, 0.6);
+      }
+    }
+  });
+
+  const targetBaseScale = MOB_BASE_SCALE[type] ?? MOB_BASE_SCALE.default;
+
+  if (!primaryMesh) {
+    group.userData.baseScale = targetBaseScale;
+    group.userData.isMobRoot = true;
+    return;
+  }
+
+  const targetMesh = primaryMesh as THREE.Mesh<THREE.BufferGeometry, THREE.Material | THREE.Material[]>;
+  const sourceGeometry = (targetMesh.geometry as THREE.BufferGeometry).clone();
+
+  const glowMaterial = new THREE.MeshBasicMaterial({
+    color: glowColors[type] ?? glowColors.default,
+    transparent: true,
+    opacity: 0.14,
+    side: THREE.BackSide,
+    depthWrite: false
+  });
+  const glowMesh = new THREE.Mesh(sourceGeometry.clone(), glowMaterial);
+  glowMesh.scale.setScalar(1.28);
+  glowMesh.name = 'mobGlowHull';
+  targetMesh.add(glowMesh);
+
+  const rimMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.22,
+    side: THREE.FrontSide,
+    depthWrite: false
+  });
+  const rimMesh = new THREE.Mesh(sourceGeometry.clone(), rimMaterial);
+  rimMesh.scale.setScalar(1.05);
+  rimMesh.name = 'mobRimHull';
+  targetMesh.add(rimMesh);
+
+  group.userData.baseScale = targetBaseScale;
+  group.userData.mobType = type;
+  group.userData.isMobRoot = true;
+}
+
+function clonePrototype(group: THREE.Group, type: string): THREE.Object3D {
   const clone = group.clone(true);
   clone.traverse(obj => {
     if ((obj as THREE.Mesh).isMesh) {
       const mesh = obj as THREE.Mesh;
-
-      // Validate geometry before using it
-      if (mesh.geometry) {
-        const positionAttribute = mesh.geometry.attributes.position;
-        if (positionAttribute) {
-          // Check for NaN values in position data
-          const positions = positionAttribute.array;
-          let hasNaN = false;
-          for (let i = 0; i < positions.length; i++) {
-            if (isNaN(positions[i])) {
-              hasNaN = true;
-              console.warn('Found NaN in geometry position data, skipping mesh');
-              break;
-            }
-          }
-
-          if (!hasNaN) {
-            mesh.material = (mesh.material as THREE.Material).clone();
-            mesh.castShadow = true;
-            mesh.receiveShadow = true;
-          } else {
-            // Remove mesh with invalid geometry
-            if (mesh.parent) {
-              mesh.parent.remove(mesh);
-            }
-          }
-        }
+      if (Array.isArray(mesh.material)) {
+        mesh.material = mesh.material.map(mat => mat.clone());
+      } else if (mesh.material) {
+        mesh.material = (mesh.material as THREE.Material).clone();
       }
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
     }
   });
-  clone.userData.baseScale = group.userData.baseScale ?? 1;
+
+  const baseScale = group.userData.baseScale ?? MOB_BASE_SCALE[type] ?? MOB_BASE_SCALE.default;
+  clone.userData.baseScale = baseScale;
+  clone.userData.isMobRoot = true;
+  clone.userData.mobType = type;
+  clone.userData.animPhase = Math.random() * Math.PI * 2;
+  clone.scale.setScalar(baseScale);
   return clone;
 }
 
 function buildChargerPrototype(): THREE.Group {
   const palette = mobPalettes.charger;
   const group = new THREE.Group();
-  const bodyMat = new THREE.MeshStandardMaterial({
-    color: palette.base,
-    metalness: 0.2,
-    roughness: 0.5
-  });
-  const armorMat = new THREE.MeshStandardMaterial({
-    color: palette.accent,
-    metalness: 0.6,
-    roughness: 0.3,
-    emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.2
-  });
-  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.6, 0.9, 6, 12), bodyMat);
-  body.rotation.z = Math.PI / 2;
-  group.add(body);
 
-  const plate = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.6, 0.3, 12), armorMat);
-  plate.position.set(0.4, 0, 0);
-  plate.rotation.z = Math.PI / 2;
-  group.add(plate);
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.2, 1.4), new THREE.MeshStandardMaterial({
+    color: palette.base,
+    metalness: 0.25,
+    roughness: 0.45
+  }));
+  torso.position.y = 0.6;
+  torso.position.x = 0.25;
+  group.add(torso);
+
+  const head = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.8, 1.0), new THREE.MeshStandardMaterial({
+    color: palette.accent,
+    metalness: 0.3,
+    roughness: 0.35
+  }));
+  head.position.set(1.0, 1.1, 0);
+  group.add(head);
 
   const hornMat = new THREE.MeshStandardMaterial({
     color: palette.glow,
     emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.6
+    emissiveIntensity: 1.1,
+    metalness: 0.1,
+    roughness: 0.25
   });
-  const leftHorn = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.4, 12), hornMat);
-  leftHorn.position.set(0.45, 0.25, 0.25);
-  leftHorn.rotation.z = Math.PI / 2;
+  const hornGeometry = new THREE.BoxGeometry(0.25, 0.25, 0.9);
+  const leftHorn = new THREE.Mesh(hornGeometry, hornMat);
+  leftHorn.position.set(1.45, 1.35, 0.4);
+  leftHorn.rotation.z = -0.35;
   group.add(leftHorn);
   const rightHorn = leftHorn.clone();
-  rightHorn.position.set(0.45, 0.25, -0.25);
+  rightHorn.position.z = -0.4;
+  rightHorn.rotation.z = 0.35;
   group.add(rightHorn);
 
-  group.userData.baseScale = 1;
+  const shoulder = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.7, 1.6), new THREE.MeshStandardMaterial({
+    color: palette.base,
+    metalness: 0.2,
+    roughness: 0.5
+  }));
+  shoulder.position.set(0.45, 1.0, 0);
+  group.add(shoulder);
+
+  const plate = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.3, 1.2), new THREE.MeshStandardMaterial({
+    color: palette.accent,
+    metalness: 0.5,
+    roughness: 0.4
+  }));
+  plate.position.set(0.2, 0.95, 0);
+  group.add(plate);
+
+  const legMaterial = new THREE.MeshStandardMaterial({
+    color: 0x2f1f12,
+    metalness: 0.1,
+    roughness: 0.6
+  });
+  const legGeometry = new THREE.BoxGeometry(0.35, 0.8, 0.5);
+  const legOffsets: Array<[number, number]> = [
+    [-0.4, 0.6],
+    [-0.4, -0.6],
+    [0.8, 0.65],
+    [0.8, -0.65]
+  ];
+  legOffsets.forEach(offset => {
+    const leg = new THREE.Mesh(legGeometry, legMaterial);
+    leg.position.set(offset[0], 0.4, offset[1]);
+    group.add(leg);
+  });
+
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.4, 0.8), new THREE.MeshStandardMaterial({
+    color: palette.base,
+    metalness: 0.2,
+    roughness: 0.45
+  }));
+  tail.position.set(-0.9, 0.75, 0);
+  group.add(tail);
+
+  group.userData.baseScale = 1.9;
+  applyMobPostProcess(group, 'charger');
   return group;
 }
 
 function buildShooterPrototype(): THREE.Group {
   const palette = mobPalettes.shooter;
   const group = new THREE.Group();
-  const coreMat = new THREE.MeshStandardMaterial({
-    color: palette.glow,
-    emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.8,
-    metalness: 0.1,
-    roughness: 0.2
-  });
-  const shellMat = new THREE.MeshStandardMaterial({
+
+  const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.4, 1.4), new THREE.MeshStandardMaterial({
     color: palette.base,
+    metalness: 0.55,
+    roughness: 0.4
+  }));
+  chassis.position.y = 0.55;
+  group.add(chassis);
+
+  const core = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.9, 0.9), new THREE.MeshStandardMaterial({
+    color: palette.accent,
+    emissive: new THREE.Color(palette.glow),
+    emissiveIntensity: 0.9,
+    metalness: 0.2,
+    roughness: 0.25
+  }));
+  core.position.y = 0.85;
+  group.add(core);
+
+  const barrelMaterial = new THREE.MeshStandardMaterial({
+    color: 0x15263f,
     metalness: 0.6,
     roughness: 0.35
   });
-  const core = new THREE.Mesh(new THREE.SphereGeometry(0.35, 20, 18), coreMat);
-  group.add(core);
-  const shell = new THREE.Mesh(new THREE.TorusGeometry(0.55, 0.12, 16, 32), shellMat);
-  shell.rotation.x = Math.PI / 2;
-  group.add(shell);
-  const finsMat = new THREE.MeshStandardMaterial({
-    color: palette.accent,
-    metalness: 0.3,
-    roughness: 0.4
-  });
-  for (let i = 0; i < 3; i++) {
-    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.5, 0.25), finsMat);
-    fin.position.set(0, 0, 0);
-    fin.rotation.y = (i * Math.PI * 2) / 3;
-    fin.position.x = Math.cos(fin.rotation.y) * 0.55;
-    fin.position.z = Math.sin(fin.rotation.y) * 0.55;
-    group.add(fin);
+  const barrelGeometry = new THREE.BoxGeometry(0.3, 0.3, 1.4);
+  for (let i = 0; i < 4; i++) {
+    const barrel = new THREE.Mesh(barrelGeometry, barrelMaterial);
+    barrel.position.y = 0.9;
+    barrel.rotation.y = (Math.PI / 2) * i;
+    barrel.position.x = Math.cos((Math.PI / 2) * i) * 0.8;
+    barrel.position.z = Math.sin((Math.PI / 2) * i) * 0.8;
+    group.add(barrel);
   }
-  group.userData.baseScale = 1;
+
+  const thrusterMaterial = new THREE.MeshStandardMaterial({
+    color: palette.glow,
+    emissive: new THREE.Color(palette.glow),
+    emissiveIntensity: 0.85,
+    metalness: 0.15,
+    roughness: 0.2
+  });
+  const thrusterGeometry = new THREE.BoxGeometry(0.4, 0.3, 0.4);
+  for (let i = 0; i < 4; i++) {
+    const thruster = new THREE.Mesh(thrusterGeometry, thrusterMaterial);
+    thruster.position.set(Math.cos((Math.PI / 2) * i) * 0.9, 0.2, Math.sin((Math.PI / 2) * i) * 0.9);
+    group.add(thruster);
+  }
+
+  group.userData.baseScale = 1.7;
+  applyMobPostProcess(group, 'shooter');
   return group;
 }
 
 function buildJumperPrototype(): THREE.Group {
   const palette = mobPalettes.jumper;
   const group = new THREE.Group();
-  const bodyMat = new THREE.MeshStandardMaterial({
+
+  const abdomen = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.6, 1.9), new THREE.MeshStandardMaterial({
     color: palette.base,
-    metalness: 0.25,
-    roughness: 0.45
-  });
-  const body = new THREE.Mesh(new THREE.ConeGeometry(0.5, 1.2, 16, 4), bodyMat);
-  body.position.y = 0.6;
-  group.add(body);
-  const visor = new THREE.Mesh(new THREE.SphereGeometry(0.25, 14, 12), new THREE.MeshStandardMaterial({
+    metalness: 0.3,
+    roughness: 0.4
+  }));
+  abdomen.position.y = 0.6;
+  group.add(abdomen);
+
+  const thorax = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.7, 1.0), new THREE.MeshStandardMaterial({
     color: palette.accent,
+    metalness: 0.25,
+    roughness: 0.35
+  }));
+  thorax.position.set(0.6, 0.95, 0);
+  group.add(thorax);
+
+  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.4, 0.8), new THREE.MeshStandardMaterial({
+    color: palette.glow,
     emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.6,
-    metalness: 0.15,
+    emissiveIntensity: 0.8,
+    metalness: 0.1,
     roughness: 0.2
   }));
-  visor.position.set(0.15, 0.8, 0.35);
+  visor.position.set(1.2, 0.9, 0);
   group.add(visor);
-  const legMat = new THREE.MeshStandardMaterial({ color: palette.accent, metalness: 0.5, roughness: 0.4 });
-  for (let i = 0; i < 3; i++) {
-    const leg = new THREE.Mesh(new THREE.CapsuleGeometry(0.08, 0.4, 4, 8), legMat);
-    leg.position.set(Math.cos((i * Math.PI * 2) / 3) * 0.35, 0.1, Math.sin((i * Math.PI * 2) / 3) * 0.35);
-    leg.rotation.z = Math.PI / 2;
+
+  const legMaterial = new THREE.MeshStandardMaterial({
+    color: 0x264a33,
+    metalness: 0.2,
+    roughness: 0.55
+  });
+  const legGeometry = new THREE.BoxGeometry(0.25, 0.25, 1.6);
+  for (let i = 0; i < 6; i++) {
+    const leg = new THREE.Mesh(legGeometry, legMaterial);
+    const angle = (Math.PI / 3) * i;
+    leg.position.set(Math.cos(angle) * 0.9, 0.4, Math.sin(angle) * 0.9);
+    leg.rotation.y = angle;
+    leg.rotation.z = (i % 2 === 0 ? 1 : -1) * 0.35;
     group.add(leg);
   }
-  group.userData.baseScale = 1;
+
+  const booster = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.4, 0.5), new THREE.MeshStandardMaterial({
+    color: palette.glow,
+    emissive: new THREE.Color(palette.glow),
+    emissiveIntensity: 0.9
+  }));
+  booster.position.set(-0.7, 0.9, 0);
+  group.add(booster);
+
+  group.userData.baseScale = 1.6;
+  applyMobPostProcess(group, 'jumper');
   return group;
 }
 
 function buildSniperPrototype(): THREE.Group {
   const palette = mobPalettes.sniper;
   const group = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 1.4, 16), new THREE.MeshStandardMaterial({
+
+  const tripodMaterial = new THREE.MeshStandardMaterial({ color: 0x1e1a2f, metalness: 0.35, roughness: 0.55 });
+  const legGeometry = new THREE.BoxGeometry(0.25, 1.4, 0.25);
+  for (let i = 0; i < 3; i++) {
+    const leg = new THREE.Mesh(legGeometry, tripodMaterial);
+    const angle = (Math.PI * 2 * i) / 3;
+    leg.position.set(Math.cos(angle) * 0.7, 0.7, Math.sin(angle) * 0.7);
+    leg.rotation.y = angle;
+    group.add(leg);
+  }
+
+  const spine = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.2, 0.6), new THREE.MeshStandardMaterial({
     color: palette.base,
-    metalness: 0.55,
+    metalness: 0.45,
     roughness: 0.35
   }));
-  body.position.y = 0.7;
-  group.add(body);
-  const scope = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.7, 16), new THREE.MeshStandardMaterial({
+  spine.position.y = 1.6;
+  group.add(spine);
+
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.7, 0.9), new THREE.MeshStandardMaterial({
     color: palette.accent,
-    metalness: 0.35,
-    roughness: 0.25,
+    metalness: 0.3,
+    roughness: 0.3
+  }));
+  head.position.y = 2.6;
+  group.add(head);
+
+  const scope = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.35, 0.35), new THREE.MeshStandardMaterial({
+    color: palette.glow,
     emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.35
+    emissiveIntensity: 0.9,
+    metalness: 0.2,
+    roughness: 0.2
   }));
-  scope.position.set(0.3, 1.0, 0);
-  scope.rotation.z = Math.PI / 2;
+  scope.position.set(0.0, 2.8, 0);
   group.add(scope);
-  const base = new THREE.Mesh(new THREE.ConeGeometry(0.45, 0.35, 12), new THREE.MeshStandardMaterial({
-    color: 0x171321,
-    metalness: 0.4,
-    roughness: 0.6
+
+  const antenna = new THREE.Mesh(new THREE.BoxGeometry(0.15, 1.4, 0.15), new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    emissive: new THREE.Color(0xbcd7ff),
+    emissiveIntensity: 0.6
   }));
-  base.position.y = 0.15;
-  group.add(base);
-  group.userData.baseScale = 1.1;
+  antenna.position.set(-0.35, 2.9, 0);
+  group.add(antenna);
+
+  group.userData.baseScale = 1.8;
+  applyMobPostProcess(group, 'sniper');
   return group;
 }
 
 function buildTankPrototype(): THREE.Group {
   const palette = mobPalettes.tank;
   const group = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.8, 1.2), new THREE.MeshStandardMaterial({
+
+  const trackMaterial = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, metalness: 0.2, roughness: 0.65 });
+  const trackGeometry = new THREE.BoxGeometry(2.2, 0.6, 0.6);
+  const leftTrack = new THREE.Mesh(trackGeometry, trackMaterial);
+  leftTrack.position.set(0, 0.3, 0.9);
+  group.add(leftTrack);
+  const rightTrack = leftTrack.clone();
+  rightTrack.position.z = -0.9;
+  group.add(rightTrack);
+
+  const hull = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.9, 1.6), new THREE.MeshStandardMaterial({
     color: palette.base,
-    metalness: 0.4,
-    roughness: 0.5
+    metalness: 0.45,
+    roughness: 0.45
   }));
-  body.position.y = 0.4;
-  group.add(body);
-  const armor = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.35, 1.4), new THREE.MeshStandardMaterial({
+  hull.position.y = 0.95;
+  group.add(hull);
+
+  const turret = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.7, 1.2), new THREE.MeshStandardMaterial({
     color: palette.accent,
-    metalness: 0.65,
-    roughness: 0.3
+    metalness: 0.55,
+    roughness: 0.35
   }));
-  armor.position.y = 0.85;
-  group.add(armor);
-  const glow = new THREE.Mesh(new THREE.SphereGeometry(0.35, 12, 10), new THREE.MeshStandardMaterial({
+  turret.position.y = 1.5;
+  group.add(turret);
+
+  const cannon = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.35, 0.35), new THREE.MeshStandardMaterial({
     color: palette.glow,
     emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.5,
-    metalness: 0.1,
-    roughness: 0.2
+    emissiveIntensity: 0.7,
+    metalness: 0.3,
+    roughness: 0.25
   }));
-  glow.position.y = 0.75;
-  group.add(glow);
-  group.userData.baseScale = 1.2;
+  cannon.position.set(1.3, 1.55, 0);
+  group.add(cannon);
+
+  const exhaust = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), new THREE.MeshStandardMaterial({
+    color: 0xff9455,
+    emissive: new THREE.Color(0xff9455),
+    emissiveIntensity: 0.8
+  }));
+  exhaust.position.set(-0.9, 1.4, 0);
+  group.add(exhaust);
+
+  group.userData.baseScale = 2.0;
+  applyMobPostProcess(group, 'tank');
   return group;
 }
 
 function buildSwarmPrototype(): THREE.Group {
   const palette = mobPalettes.swarm;
   const group = new THREE.Group();
-  const shardMat = new THREE.MeshStandardMaterial({
+
+  const shardMaterial = new THREE.MeshStandardMaterial({
     color: palette.base,
     emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.4,
+    emissiveIntensity: 0.6,
     metalness: 0.2,
     roughness: 0.3
   });
-  for (let i = 0; i < 4; i++) {
-    const shard = new THREE.Mesh(new THREE.TetrahedronGeometry(0.35, 0), shardMat);
-    shard.position.set((Math.random() - 0.5) * 0.6, (Math.random() - 0.2) * 0.6, (Math.random() - 0.5) * 0.6);
-    shard.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
-    group.add(shard);
+
+  for (let i = 0; i < 7; i++) {
+    const cube = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6, 0.6), shardMaterial);
+    cube.position.set((Math.random() - 0.5) * 1.2, Math.random() * 0.8 + 0.2, (Math.random() - 0.5) * 1.2);
+    cube.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+    group.add(cube);
   }
-  group.userData.baseScale = 0.8;
+
+  const nucleus = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), new THREE.MeshStandardMaterial({
+    color: palette.glow,
+    emissive: new THREE.Color(palette.glow),
+    emissiveIntensity: 1.0,
+    metalness: 0.1,
+    roughness: 0.2
+  }));
+  nucleus.position.y = 0.8;
+  group.add(nucleus);
+
+  group.userData.baseScale = 1.4;
+  applyMobPostProcess(group, 'swarm');
   return group;
 }
 
@@ -867,12 +1379,19 @@ function disposeObject(obj: THREE.Object3D) {
 
 function createMobModel(type: string): THREE.Object3D {
   const key = mobPrototypeFactories[type] ? type : 'default';
-  let prototype = mobPrototypes.get(key);
+  let prototype = mobPrototypes.get(type);
+
+  if (!prototype) {
+    prototype = mobPrototypes.get(key) ?? mobFallbackPrototypes.get(key);
+  }
+
   if (!prototype) {
     prototype = mobPrototypeFactories[key]();
+    applyMobPostProcess(prototype, key);
     mobPrototypes.set(key, prototype);
   }
-  return clonePrototype(prototype);
+
+  return clonePrototype(prototype, key);
 }
 
 function applyWeaponCosmetics(weapon: { rarity?: string; archetype?: string }) {
@@ -1429,16 +1948,19 @@ function connect() {
         }
 
         // Store target position for interpolation
+        // Use terrain height for mob Y position
+        const mobY = getTerrainHeight(m.x, m.z);
+
         if (!entityStates.has(m.id)) {
           entityStates.set(m.id, {
-            current: { x: m.x, y: m.y, z: m.z },
-            target: { x: m.x, y: m.y, z: m.z },
+            current: { x: m.x, y: mobY, z: m.z },
+            target: { x: m.x, y: mobY, z: m.z },
             lastUpdate: nowMs()
           });
         } else {
           const state = entityStates.get(m.id)!;
           state.current = { ...state.target };
-          state.target = { x: m.x, y: m.y, z: m.z };
+          state.target = { x: m.x, y: mobY, z: m.z };
            state.lastUpdate = nowMs();
         }
 
@@ -1517,22 +2039,26 @@ function connect() {
 
       // REPOMARK:SCOPE: 5.1 - Use muzzle-based origin for local player shots; otherwise use server origin.
       if (msg.event === 'shot') {
+        const isLocalShot = msg.playerId === pid;
         const startVec =
-          msg.playerId === pid
+          isLocalShot
             ? getMuzzleWorldPosition()
             : new THREE.Vector3(msg.origin[0], msg.origin[1], msg.origin[2]);
         const dirVec = new THREE.Vector3(msg.direction[0], msg.direction[1], msg.direction[2]).normalize();
 
-        createBulletVisual(startVec, dirVec, !!msg.hit); // NEW visual with tracer + projectile
+        if (!(isSpectator && isLocalShot)) {
+          createBulletVisual(startVec, dirVec, !!msg.hit); // NEW visual with tracer + projectile
+        }
 
         // Play weapon sound based on the shooting player's equipped weapon
-        if (msg.playerId === pid) {
-          // Local player shooting
-          const weaponType = myPlayer?.equipped?.archetype || 'pistol';
-          const soundName = weaponType === 'smg' ? 'smg_fire' :
-                           weaponType === 'rifle' ? 'rifle_fire' :
-                           weaponType === 'shotgun' ? 'shotgun_fire' : 'pistol_fire';
-          audioManager.play(soundName);
+        if (isLocalShot) {
+          if (!isSpectator) {
+            const weaponType = myPlayer?.equipped?.archetype || 'pistol';
+            const soundName = weaponType === 'smg' ? 'smg_fire' :
+                             weaponType === 'rifle' ? 'rifle_fire' :
+                             weaponType === 'shotgun' ? 'shotgun_fire' : 'pistol_fire';
+            audioManager.play(soundName);
+          }
         } else {
           // Other player shooting - use 3D positional audio
           const weaponType = (players.get(msg.playerId) as any)?.equipped?.archetype || 'pistol';
@@ -1557,54 +2083,78 @@ function connect() {
       }
 
       if (msg.event === 'damage' && msg.targetId === pid) {
-        trackEvent('damage_taken', { amount: msg.damage, sourceId: msg.sourceId });
-        // Play pain sound based on damage amount
-        audioManager.playPainSound(msg.damage);
-        lastDamageTime = performance.now();
-        // Screen shake effect when player takes damage
-        const shakeIntensity = Math.min(msg.damage * 0.002, 0.1);
-        const shakeDuration = 200;
-        const shakeStart = performance.now();
-        
-        const originalCameraPos = camera.position.clone();
-        
-        const shakeCamera = () => {
-          const elapsed = performance.now() - shakeStart;
-          if (elapsed < shakeDuration) {
-            const progress = elapsed / shakeDuration;
-            const currentIntensity = shakeIntensity * (1 - progress);
-            
-            camera.position.x = originalCameraPos.x + (Math.random() - 0.5) * currentIntensity;
-            camera.position.z = originalCameraPos.z + (Math.random() - 0.5) * currentIntensity;
-            
-            requestAnimationFrame(shakeCamera);
-          } else {
-            camera.position.copy(originalCameraPos);
+        if (isSpectator) {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'damageAck',
+              ignored: true,
+              reason: 'spectator',
+              amount: msg.damage,
+              sourceId: msg.sourceId,
+              t: nowMs()
+            }));
           }
-        };
-        shakeCamera();
-        
-        // Red damage flash overlay
-        const damageOverlay = document.createElement('div');
-        damageOverlay.style.position = 'fixed';
-        damageOverlay.style.top = '0';
-        damageOverlay.style.left = '0';
-        damageOverlay.style.width = '100%';
-        damageOverlay.style.height = '100%';
-        damageOverlay.style.backgroundColor = 'red';
-        damageOverlay.style.opacity = '0.3';
-        damageOverlay.style.pointerEvents = 'none';
-        damageOverlay.style.zIndex = '999';
-        document.body.appendChild(damageOverlay);
-        
-        // Fade out the damage overlay
-        setTimeout(() => {
-          damageOverlay.style.transition = 'opacity 0.3s';
-          damageOverlay.style.opacity = '0';
+          trackEvent('spectator_damage_ignored', {
+            amount: msg.damage,
+            sourceId: msg.sourceId
+          });
+        } else {
+          trackEvent('damage_taken', { amount: msg.damage, sourceId: msg.sourceId });
+
+          const attackerObj = mobs.get(msg.sourceId) ?? players.get(msg.sourceId);
+          if (attackerObj && (attackerObj as THREE.Object3D).isObject3D) {
+            (attackerObj as THREE.Object3D).getWorldPosition(damageIndicatorScratch.source);
+            showDamageIndicator(damageIndicatorScratch.source);
+          }
+
+          // Play pain sound based on damage amount
+          audioManager.playPainSound(msg.damage);
+          lastDamageTime = performance.now();
+          // Screen shake effect when player takes damage
+          const shakeIntensity = Math.min(msg.damage * 0.002, 0.1);
+          const shakeDuration = 200;
+          const shakeStart = performance.now();
+          
+          const originalCameraPos = camera.position.clone();
+          
+          const shakeCamera = () => {
+            const elapsed = performance.now() - shakeStart;
+            if (elapsed < shakeDuration) {
+              const progress = elapsed / shakeDuration;
+              const currentIntensity = shakeIntensity * (1 - progress);
+              
+              camera.position.x = originalCameraPos.x + (Math.random() - 0.5) * currentIntensity;
+              camera.position.z = originalCameraPos.z + (Math.random() - 0.5) * currentIntensity;
+              
+              requestAnimationFrame(shakeCamera);
+            } else {
+              camera.position.copy(originalCameraPos);
+            }
+          };
+          shakeCamera();
+          
+          // Red damage flash overlay
+          const damageOverlay = document.createElement('div');
+          damageOverlay.style.position = 'fixed';
+          damageOverlay.style.top = '0';
+          damageOverlay.style.left = '0';
+          damageOverlay.style.width = '100%';
+          damageOverlay.style.height = '100%';
+          damageOverlay.style.backgroundColor = 'red';
+          damageOverlay.style.opacity = '0.3';
+          damageOverlay.style.pointerEvents = 'none';
+          damageOverlay.style.zIndex = '999';
+          document.body.appendChild(damageOverlay);
+          
+          // Fade out the damage overlay
           setTimeout(() => {
-            document.body.removeChild(damageOverlay);
-          }, 300);
-        }, 100);
+            damageOverlay.style.transition = 'opacity 0.3s';
+            damageOverlay.style.opacity = '0';
+            setTimeout(() => {
+              document.body.removeChild(damageOverlay);
+            }, 300);
+          }, 100);
+        }
       }
 
       if (msg.event === 'lootDrop') {
@@ -1762,7 +2312,14 @@ document.addEventListener('mousemove', (e) => {
 document.addEventListener('mousedown', (e) => {
   if (isPointerLocked && e.button === 0) { // Left click only when locked
     e.preventDefault();
-    firing = true;
+    if (!isSpectator) {
+      firing = true;
+    }
+  }
+  if (isPointerLocked && e.button === 2) { // Right click -> ADS on
+    e.preventDefault();
+    isADS = true;
+    trackEvent('ads_on');
   }
 });
 
@@ -1770,6 +2327,11 @@ document.addEventListener('mouseup', (e) => {
   if (e.button === 0) {
     e.preventDefault();
     firing = false;
+  }
+  if (e.button === 2) {
+    e.preventDefault();
+    isADS = false;
+    trackEvent('ads_off');
   }
 });
 
@@ -1851,51 +2413,60 @@ document.addEventListener('keyup', (e) => {
 // Improved collision with sliding response
 function resolveCollision(currentPos: THREE.Vector3, desiredPos: THREE.Vector3, radius = 0.5): THREE.Vector3 {
   const result = desiredPos.clone();
-  
-  // Check collision for each axis separately to allow sliding
+  const STEP_HEIGHT = 0.6;
+
   for (const obstacle of obstacles.values()) {
-    // Expand bounds by player radius
     const expandedMin = obstacle.bounds.min.clone().subScalar(radius);
     const expandedMax = obstacle.bounds.max.clone().addScalar(radius);
-    
-    // Check if desired position intersects
-    if (desiredPos.x >= expandedMin.x && desiredPos.x <= expandedMax.x &&
-        desiredPos.y >= expandedMin.y && desiredPos.y <= expandedMax.y &&
-        desiredPos.z >= expandedMin.z && desiredPos.z <= expandedMax.z) {
-      
-      // Find the axis with smallest penetration depth
-      const penetrations = [
-        { axis: 'x', depth: Math.min(desiredPos.x - expandedMin.x, expandedMax.x - desiredPos.x) },
-        { axis: 'y', depth: Math.min(desiredPos.y - expandedMin.y, expandedMax.y - desiredPos.y) },
-        { axis: 'z', depth: Math.min(desiredPos.z - expandedMin.z, expandedMax.z - desiredPos.z) }
-      ];
-      
-      penetrations.sort((a, b) => a.depth - b.depth);
-      const smallest = penetrations[0];
-      
-      // Push out along the axis with smallest penetration (sliding)
-      if (smallest.axis === 'x') {
-        if (currentPos.x < obstacle.bounds.min.x) {
-          result.x = expandedMin.x - 0.001;
-        } else {
-          result.x = expandedMax.x + 0.001;
-        }
-      } else if (smallest.axis === 'y') {
-        if (currentPos.y < obstacle.bounds.min.y) {
-          result.y = expandedMin.y - 0.001;
-        } else {
-          result.y = expandedMax.y + 0.001;
-        }
+
+    const intersects =
+      desiredPos.x >= expandedMin.x && desiredPos.x <= expandedMax.x &&
+      desiredPos.y >= expandedMin.y && desiredPos.y <= expandedMax.y &&
+      desiredPos.z >= expandedMin.z && desiredPos.z <= expandedMax.z;
+
+    if (!intersects) continue;
+
+    // Determine axis with smallest penetration
+    const penetrations = [
+      { axis: 'x', depth: Math.min(desiredPos.x - expandedMin.x, expandedMax.x - desiredPos.x) },
+      { axis: 'y', depth: Math.min(desiredPos.y - expandedMin.y, expandedMax.y - desiredPos.y) },
+      { axis: 'z', depth: Math.min(desiredPos.z - expandedMin.z, expandedMax.z - desiredPos.z) }
+    ].sort((a, b) => a.depth - b.depth);
+    const smallest = penetrations[0];
+
+    // Try a step-up when hitting vertical face (x/z), if the top of obstacle is within step height
+    if ((smallest.axis === 'x' || smallest.axis === 'z')) {
+      const topY = expandedMax.y + 0.001;
+      const requiredLift = topY - currentPos.y;
+      if (requiredLift > 0 && requiredLift <= STEP_HEIGHT) {
+        // Step onto obstacle top and preserve intended horizontal motion
+        result.set(desiredPos.x, topY, desiredPos.z);
+        continue;
+      }
+    }
+
+    // Otherwise slide-along as before
+    if (smallest.axis === 'x') {
+      if (currentPos.x < obstacle.bounds.min.x) {
+        result.x = expandedMin.x - 0.001;
       } else {
-        if (currentPos.z < obstacle.bounds.min.z) {
-          result.z = expandedMin.z - 0.001;
-        } else {
-          result.z = expandedMax.z + 0.001;
-        }
+        result.x = expandedMax.x + 0.001;
+      }
+    } else if (smallest.axis === 'y') {
+      if (currentPos.y < obstacle.bounds.min.y) {
+        result.y = expandedMin.y - 0.001;
+      } else {
+        result.y = expandedMax.y + 0.001;
+      }
+    } else {
+      if (currentPos.z < obstacle.bounds.min.z) {
+        result.z = expandedMin.z - 0.001;
+      } else {
+        result.z = expandedMax.z + 0.001;
       }
     }
   }
-  
+
   return result;
 }
 
@@ -1920,15 +2491,14 @@ function updateLocalPhysics() {
     right.normalize();
   }
 
-  // Get terrain height at current position
   const terrainHeight = getTerrainHeight(localPosition.x, localPosition.z);
   const onGround = localPosition.y <= terrainHeight + 0.1;
-  
-  // Update stamina
+
   if (isSpectator) {
     return;
   }
 
+  // Stamina and sprint are unchanged...
   if (isSprinting && (keys.has('KeyW') || keys.has('KeyS') || keys.has('KeyA') || keys.has('KeyD'))) {
     stamina = Math.max(0, stamina - dt * 20);
     if (stamina <= 0) {
@@ -1938,24 +2508,21 @@ function updateLocalPhysics() {
   } else {
     stamina = Math.min(100, stamina + dt * 10);
   }
-  
-  // Compute desired horizontal target velocity from input
+
+  // Inputs
   let inputForward = 0;
   let inputRight = 0;
-  
   if (keys.has('KeyW')) inputForward += 1;
   if (keys.has('KeyS')) inputForward -= 1;
   if (keys.has('KeyD')) inputRight += 1;
   if (keys.has('KeyA')) inputRight -= 1;
-  
-  // Normalize diagonal movement
   const inputLen = Math.sqrt(inputForward * inputForward + inputRight * inputRight);
   if (inputLen > 1) {
     inputForward /= inputLen;
     inputRight /= inputLen;
   }
-  
-  // Apply movement modifiers
+
+  // Movement modifiers (ADS penalty adds subtle control feel)
   let speedMultiplier = 1.0;
   if (isSliding) {
     speedMultiplier = MOVE.slideBoost;
@@ -1964,30 +2531,31 @@ function updateLocalPhysics() {
   } else if (isCrouching) {
     speedMultiplier = MOVE.crouchMultiplier;
   }
-  
+  if (isADS) {
+    speedMultiplier *= 0.85;
+  }
+
   const targetVX = (inputRight * right.x + inputForward * forward.x) * MOVE.maxSpeed * speedMultiplier;
   const targetVZ = (inputRight * right.z + inputForward * forward.z) * MOVE.maxSpeed * speedMultiplier;
-  
-  // Accelerate toward target with smooth acceleration (reduced in air)
+
+  // ... existing acceleration/friction/reconciliation/gravity logic unchanged ...
+
   const controlFactor = onGround ? 1.0 : MOVE.airControl;
   const ax = (targetVX - velocity.x) * MOVE.accel * controlFactor;
   const az = (targetVZ - velocity.z) * MOVE.accel * controlFactor;
   velocity.x += ax * dt;
   velocity.z += az * dt;
-  
-  // Apply ground friction when no input (only on ground)
+
   if (onGround && inputRight === 0 && inputForward === 0 && !isSliding) {
     velocity.x *= 1 / (1 + MOVE.friction * dt);
     velocity.z *= 1 / (1 + MOVE.friction * dt);
   }
-  
-  // Slide friction (reduced)
+
   if (isSliding) {
     velocity.x *= 1 / (1 + MOVE.friction * 0.2 * dt);
     velocity.z *= 1 / (1 + MOVE.friction * 0.2 * dt);
   }
-  
-  // Apply server reconciliation smoothly
+
   localPosition.x += reconcileError.x * RECONCILE.posGain * dt;
   localPosition.y += reconcileError.y * RECONCILE.posGain * dt;
   localPosition.z += reconcileError.z * RECONCILE.posGain * dt;
@@ -1995,99 +2563,78 @@ function updateLocalPhysics() {
   reconcileError.x *= decay;
   reconcileError.y *= decay;
   reconcileError.z *= decay;
-  
-  // Clamp final speed to avoid spikes from reconciliation
+
   const vLen = Math.hypot(velocity.x, velocity.z);
   if (vLen > MOVE.maxSpeed * 1.5) {
     const scale = (MOVE.maxSpeed * 1.5) / vLen;
     velocity.x *= scale;
     velocity.z *= scale;
   }
-  
-  // Update coyote time
+
   if (onGround) {
     coyoteTime = COYOTE_TIME_MAX;
   } else {
     coyoteTime = Math.max(0, coyoteTime - dt);
   }
-  
-  // Update jump buffer
+
   if (keys.has('Space')) {
     jumpBufferTime = JUMP_BUFFER_MAX;
   } else {
     jumpBufferTime = Math.max(0, jumpBufferTime - dt);
   }
-  
-  // Jumping with coyote time and jump buffer
+
   if (jumpBufferTime > 0 && (onGround || coyoteTime > 0)) {
     velocity.y = PHYSICS.jumpPower;
     if (isSliding) {
-      // Boost horizontal velocity when jump-sliding
       velocity.x *= 1.3;
       velocity.z *= 1.3;
     }
     coyoteTime = 0;
     jumpBufferTime = 0;
   }
-  
-  // Apply gravity with terminal velocity
+
   if (!onGround) {
     velocity.y -= PHYSICS.gravity * dt;
     velocity.y = Math.max(-PHYSICS.terminalVelocity, velocity.y);
-    
-    // Air resistance
     velocity.x *= 1 - PHYSICS.airResistance * dt;
     velocity.z *= 1 - PHYSICS.airResistance * dt;
   }
-  
-  // Apply movement with improved collision
+
   const currentPos = new THREE.Vector3(localPosition.x, localPosition.y, localPosition.z);
   const desiredPos = new THREE.Vector3(
     localPosition.x + velocity.x * dt,
     localPosition.y + velocity.y * dt,
     localPosition.z + velocity.z * dt
   );
-  
-  // Resolve collision with sliding
+
   const resolvedPos = resolveCollision(currentPos, desiredPos);
-  
-  // Apply resolved position
+
   localPosition.x = resolvedPos.x;
   localPosition.y = resolvedPos.y;
   localPosition.z = resolvedPos.z;
-  
-  // Reduce velocity if we hit something
+
   if (Math.abs(resolvedPos.x - desiredPos.x) > 0.01) velocity.x *= 0.5;
   if (Math.abs(resolvedPos.y - desiredPos.y) > 0.01) velocity.y = 0;
   if (Math.abs(resolvedPos.z - desiredPos.z) > 0.01) velocity.z *= 0.5;
-  
-  // Terrain collision
+
   const newTerrainHeight = getTerrainHeight(localPosition.x, localPosition.z);
   if (localPosition.y <= newTerrainHeight) {
     localPosition.y = newTerrainHeight;
     if (velocity.y < 0) {
       velocity.y = 0;
-      
-      // Check for slope sliding
-      const slope = Math.abs(newTerrainHeight - terrainHeight) / dt;
+      const slopeNormal = getTerrainNormal(localPosition.x, localPosition.z);
+      const slope = Math.sqrt(1 - slopeNormal.y * slopeNormal.y);
       if (slope > Math.tan(PHYSICS.slopeSlideAngle * Math.PI / 180)) {
-        // Slide down steep slopes
-        const slideDir = new THREE.Vector3(
-          newTerrainHeight > terrainHeight ? -velocity.x : velocity.x,
-          0,
-          newTerrainHeight > terrainHeight ? -velocity.z : velocity.z
-        ).normalize();
-        velocity.x += slideDir.x * 2;
-        velocity.z += slideDir.z * 2;
+        const downhill = new THREE.Vector3(-slopeNormal.x, 0, -slopeNormal.z).normalize();
+        velocity.x += downhill.x * 2;
+        velocity.z += downhill.z * 2;
       }
     }
   }
 
-  // World bounds
   localPosition.x = Math.max(0, Math.min(64, localPosition.x));
   localPosition.z = Math.max(0, Math.min(64, localPosition.z));
 
-  // Update player mesh position
   me.position.set(localPosition.x, localPosition.y, localPosition.z);
 }
 
@@ -2119,15 +2666,12 @@ function sendInput() {
 
   const inputData = {
     type: 'input',
-     t: nowMs(),
+    t: nowMs(),
     move,
     aim: [aimDir.x, aimDir.y, aimDir.z],
-    firing
+    firing: !isSpectator && firing,
+    ads: !!isADS
   };
-
-  // Debug when firing
-  if (firing) {
-  }
 
   ws.send(JSON.stringify(inputData));
 }
@@ -2168,23 +2712,53 @@ function updateCamera() {
     localPosition.z
   );
 
-  // Apply rotation from mouse look
+  // Target FOV by ADS state; smooth toward it
+  targetFov = isADS ? ADS_FOV : BASE_FOV;
+  camera.fov += (targetFov - camera.fov) * 0.18;
+  camera.updateProjectionMatrix();
+
+  // Apply rotation from mouse look with small recoil decay
+  recoilKick *= 0.9;
   camera.rotation.order = 'YXZ';
   camera.rotation.y = yaw;
-  camera.rotation.x = pitch;
+  camera.rotation.x = pitch - recoilKick;
+
+  // Subtle weapon mounting changes in ADS
+  if (gunGroup) {
+    const targetY = isADS ? -0.28 : -0.25;
+    const targetX = isADS ? 0.28 : 0.35;
+    const targetZ = isADS ? -1.05 : -0.9;
+    gunGroup.position.x += (targetX - gunGroup.position.x) * 0.2;
+    gunGroup.position.y += (targetY - gunGroup.position.y) * 0.2;
+    gunGroup.position.z += (targetZ - gunGroup.position.z) * 0.2;
+  }
 }
 
 function updateSpectatorUI() {
   const overlay = document.getElementById('spectator-overlay');
   const countdownLabel = document.getElementById('spectator-countdown');
-  if (!overlay || !countdownLabel) return;
+  if (overlay && countdownLabel) {
+    if (isSpectator) {
+      overlay.style.display = 'flex';
+      const remaining = Math.max(0, spectatorUntil - Date.now());
+      countdownLabel.textContent = Math.ceil(remaining / 1000).toString();
+    } else {
+      overlay.style.display = 'none';
+    }
+  }
 
-  if (isSpectator) {
-    overlay.style.display = 'flex';
-    const remaining = Math.max(0, spectatorUntil - Date.now());
-    countdownLabel.textContent = Math.ceil(remaining / 1000).toString();
-  } else {
-    overlay.style.display = 'none';
+  if (gunGroup) {
+    gunGroup.visible = !isSpectator;
+  }
+
+  const crosshair = document.querySelector<HTMLElement>('.crosshair');
+  if (crosshair) {
+    crosshair.style.opacity = isSpectator ? '0' : '1';
+  }
+
+  const inventoryPanel = document.getElementById('inventory');
+  if (inventoryPanel) {
+    inventoryPanel.style.opacity = isSpectator ? '0.4' : '1';
   }
 }
 
@@ -2247,6 +2821,8 @@ function animate() {
   const frameTime = Math.min(now - lastFrameTime, 100);
   lastFrameTime = now;
 
+  updateDayNight(frameTime);
+
   // Adaptive perf sampling
   perfFrameCount++;
   perfAccumMS += frameTime;
@@ -2300,7 +2876,17 @@ function animate() {
       }
     }
     const mobMesh = mobs.get(id);
-    if (mobMesh) mobMesh.position.set(x, y, z);
+    if (mobMesh) {
+      const type = (mobMesh.userData.mobType as string | undefined) ?? 'default';
+      const baseScale = (mobMesh.userData.baseScale as number | undefined) ?? (MOB_BASE_SCALE[type] ?? MOB_BASE_SCALE.default);
+      const phase = (mobMesh.userData.animPhase as number | undefined) ?? 0;
+      const bobStrength = type === 'tank' ? 0.08 : type === 'sniper' ? 0.06 : 0.12;
+      const bob = Math.sin((now + phase) * 0.0025) * bobStrength * (baseScale / 2);
+      mobMesh.position.set(x, y + bob, z);
+
+      const spinRate = type === 'tank' ? 0.001 : type === 'sniper' ? 0.0015 : type === 'swarm' ? 0.0035 : 0.0025;
+      mobMesh.rotation.y += spinRate;
+    }
   }
 
   updateCamera();
@@ -2410,8 +2996,49 @@ function animate() {
       } else {
         raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
       }
-      const intersects = raycaster.intersectObjects(Array.from(mobs.values()));
-      outlinePass.selectedObjects = intersects.length > 0 ? [intersects[0].object] : [];
+      const mobObjects = Array.from(mobs.values());
+      const intersects = raycaster.intersectObjects(mobObjects, true);
+      const outlineSet = new Set<THREE.Object3D>();
+      const candidates: Array<{ obj: THREE.Object3D; distance: number }> = [];
+      const pushCandidate = (obj: THREE.Object3D | null | undefined, distance: number) => {
+        if (!obj) return;
+        let root: THREE.Object3D | null = obj;
+        while (root && !root.userData?.isMobRoot && root.parent) {
+          root = root.parent as THREE.Object3D;
+        }
+        if (!root) root = obj;
+        if (outlineSet.has(root)) return;
+        outlineSet.add(root);
+        candidates.push({ obj: root, distance });
+      };
+
+      const forwardDir = outlineScratch.forward.set(0, 0, -1).applyQuaternion(camera.quaternion);
+      forwardDir.y = 0;
+      if (forwardDir.lengthSq() < 1e-4) {
+        forwardDir.set(0, 0, -1);
+      }
+      forwardDir.normalize();
+
+      const toMob = outlineScratch.toMob;
+      mobObjects.forEach(mobObj => {
+        toMob.copy(mobObj.position).sub(camera.position);
+        const distance = toMob.length();
+        if (distance < 0.5 || distance > 42) return;
+        toMob.normalize();
+        const facing = toMob.dot(forwardDir);
+        if (facing > -0.25) {
+          pushCandidate(mobObj, distance);
+        }
+      });
+
+      if (intersects.length > 0) {
+        const primary = intersects[0];
+        pushCandidate(primary.object, primary.distance ?? 0);
+      }
+
+      candidates.sort((a, b) => a.distance - b.distance);
+      const MAX_OUTLINED = 6;
+      outlinePass.selectedObjects = candidates.slice(0, MAX_OUTLINED).map(entry => entry.obj);
     }
   }
 
@@ -2461,10 +3088,12 @@ function animate() {
 
 // New bullet visual that guarantees visible tracer + keeps your projectile sprite + muzzle flash
 function createBulletVisual(start: THREE.Vector3, direction: THREE.Vector3, hit: boolean) {
-  const distance = hit ? 25 : 35;
+  const weaponRange = myPlayer?.equipped?.range ?? 35;
+  const maxDistance = Math.max(25, Math.min(weaponRange, 120));
+  const distance = hit ? Math.min(maxDistance, weaponRange) : maxDistance;
   const end = new THREE.Vector3().copy(start).addScaledVector(direction, distance);
 
-  // Projectile (small glowing sphere) — keep from previous approach
+  // Projectile (small glowing sphere)
   const projectileGeometry = new THREE.SphereGeometry(0.12, 8, 6);
   const projectileMaterial = new THREE.MeshBasicMaterial({
     color: 0xffff00,
@@ -2475,21 +3104,19 @@ function createBulletVisual(start: THREE.Vector3, direction: THREE.Vector3, hit:
   projectile.position.copy(start);
   scene.add(projectile);
 
-  // Tracer streak (cylinder stretched between start/end)
+  // Tracer streak
   const tracer = allocTracer();
   const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
   const dir = new THREE.Vector3().subVectors(end, start);
   const len = Math.max(0.001, dir.length());
-
   tracer.position.copy(mid);
   tracer.scale.set(1, len, 1);
-  tracer.lookAt(end); // Simpler rotation method
-  tracer.rotateX(Math.PI / 2); // Adjust for cylinder's default orientation
-
+  tracer.lookAt(end);
+  tracer.rotateX(Math.PI / 2);
   scene.add(tracer);
   activeTracers.push({ mesh: tracer, start: performance.now(), lifetime: 400 });
-  
-  // Add a glowing line for better visibility
+
+  // Glowing line overlay
   const lineGeometry = new THREE.BufferGeometry().setFromPoints([start, end]);
   const lineMaterial = new THREE.LineBasicMaterial({
     color: 0xffff00,
@@ -2500,18 +3127,15 @@ function createBulletVisual(start: THREE.Vector3, direction: THREE.Vector3, hit:
   });
   const line = new THREE.Line(lineGeometry, lineMaterial);
   scene.add(line);
-  
-  // Clean up line after a short time
   setTimeout(() => {
     scene.remove(line);
     lineGeometry.dispose();
     lineMaterial.dispose();
   }, 250);
 
-  // Muzzle flash at muzzle
+  // Muzzle flash and projectile tween (unchanged core)
   createMuzzleFlash([start.x, start.y, start.z]);
 
-  // Animate projectile & cleanup (reuse existing bullet arrays)
   const projectileEntry = {
     projectile,
     trail: [] as THREE.Line[],
@@ -2523,7 +3147,6 @@ function createBulletVisual(start: THREE.Vector3, direction: THREE.Vector3, hit:
   };
   activeBullets.push(projectileEntry);
 
-  // Bound projectile pool
   while (activeBullets.length > 20) {
     const old = activeBullets.shift();
     if (!old) break;
@@ -2537,13 +3160,15 @@ function createBulletVisual(start: THREE.Vector3, direction: THREE.Vector3, hit:
     });
   }
 
-  // Bound tracer pool
   while (activeTracers.length > 30) {
     const t = activeTracers.shift();
     if (!t) break;
     scene.remove(t.mesh);
     freeTracer(t.mesh);
   }
+
+  // Add micro recoil
+  recoilKick += isADS ? 0.004 : 0.008;
 }
 
 // Set up volume controls
