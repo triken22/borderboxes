@@ -1,15 +1,19 @@
 // ... existing imports ...
 import * as THREE from 'three';
-import { makeChunk, makeSkybox, getTerrainHeight, getTerrainNormal, obstacles } from './world';
+import { makeChunk, makeSkybox, getTerrainHeight, getTerrainNormal, obstacles, updateTerrainAround } from './world';
+import { resourceManager } from './resourceManager';
+import { ObjectPool } from '../../shared/pooling';
+import { GameLoop } from '../../shared/GameLoop';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass';
 import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader';
 import { audioManager } from './audio';
-import { VoxelModelLoader } from './voxelLoader';
+import { ENEMY_TYPES, EnemyTypeId, WORLD_SCALE, VISUAL_STYLE, PHYSICS_TUNING } from '../../shared/gameConfig';
 
-let ws: WebSocket;
+
+let ws: WebSocket | null = null;
 let isSpectator = false;
 let spectatorUntil = 0;
 
@@ -49,7 +53,11 @@ function createNamePlate(text: string, color: number): THREE.Sprite {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
   canvas.height = 64;
-  const ctx = canvas.getContext('2d')!;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    console.warn('Unable to obtain 2D context for nameplate rendering; using fallback sprite material');
+    return new THREE.Sprite(new THREE.SpriteMaterial({ color, transparent: true }));
+  }
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.font = 'bold 32px "Press Start 2P", monospace';
   ctx.fillStyle = '#000000aa';
@@ -134,6 +142,11 @@ function createOtherPlayerModel(id: string, name: string): THREE.Object3D {
     }
   });
 
+  const bounding = new THREE.Box3().setFromObject(group);
+  const playerHeight = Math.max(0.001, bounding.max.y - bounding.min.y);
+  const normalization = WORLD_SCALE.PLAYER_HEIGHT / playerHeight;
+  group.scale.setScalar(normalization);
+
   return group;
 }
 
@@ -184,12 +197,47 @@ const difficultyButtons: HTMLButtonElement[] = difficultyPanel
   ? Array.from(difficultyPanel.querySelectorAll<HTMLButtonElement>('button[data-difficulty]'))
   : [];
 
+const rootElement = document.documentElement;
+rootElement.style.setProperty('--hud-primary', VISUAL_STYLE.COLORS.PRIMARY);
+rootElement.style.setProperty('--hud-accent', VISUAL_STYLE.COLORS.ACCENT);
+rootElement.style.setProperty('--hud-destructive', VISUAL_STYLE.COLORS.DESTRUCTIVE);
+
+const roomLabel = document.getElementById('room');
+const playersOnlineLabel = document.getElementById('players-online');
+const healthFillBar = document.getElementById('health-fill');
+const killsLabel = document.getElementById('kills');
+const inventoryPanelRoot = document.getElementById('inventory');
+
 function updateDifficultyUI(level: Difficulty) {
   currentDifficulty = level;
   difficultyButtons.forEach(btn => {
     const btnLevel = btn.dataset.difficulty as Difficulty | undefined;
     btn.classList.toggle('active', btnLevel === level);
   });
+}
+
+function isDifficulty(value: unknown): value is Difficulty {
+  return value === 'easy' || value === 'normal' || value === 'hard';
+}
+
+function isGun(value: unknown): value is Gun {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Partial<Gun>;
+  const validArchetype = candidate.archetype === 'pistol' || candidate.archetype === 'smg' || candidate.archetype === 'rifle' || candidate.archetype === 'shotgun';
+  const validRarity = candidate.rarity === 'common' || candidate.rarity === 'rare' || candidate.rarity === 'epic' || candidate.rarity === 'legendary';
+  return (
+    validArchetype &&
+    validRarity &&
+    typeof candidate.dps === 'number' &&
+    typeof candidate.mag === 'number' &&
+    typeof candidate.reloadMs === 'number' &&
+    typeof candidate.fireRate === 'number' &&
+    typeof candidate.accuracy === 'number' &&
+    typeof candidate.range === 'number' &&
+    typeof candidate.seed === 'string'
+  );
 }
 
 function sendDifficulty(level: Difficulty) {
@@ -288,21 +336,21 @@ const nowMs = () => performance.now();
 
 // Movement and reconciliation constants
 const MOVE = {
-  maxSpeed: 6.0,
+  maxSpeed: PHYSICS_TUNING.PLAYER_MAX_SPEED,
   sprintMultiplier: 1.5,
-  crouchMultiplier: 0.5,
-  accel: 28.0,    // units/s^2
-  friction: 10.0,  // 1/s
-  airControl: 0.3, // reduced control in air
-  slideBoost: 2.0
+  crouchMultiplier: 0.55,
+  accel: PHYSICS_TUNING.PLAYER_ACCELERATION,
+  decel: PHYSICS_TUNING.PLAYER_DECELERATION,
+  airControl: 0.35,
+  slideBoost: 2.2
 };
 
 const PHYSICS = {
-  gravity: 25.0,      // units/s^2
-  jumpPower: 10.0,    // initial jump velocity
-  terminalVelocity: 50.0,
-  airResistance: 0.02,
-  slopeSlideAngle: 45 // degrees
+  gravity: Math.abs(PHYSICS_TUNING.GRAVITY),
+  jumpPower: PHYSICS_TUNING.PLAYER_JUMP_FORCE,
+  terminalVelocity: 55.0,
+  airResistance: 0.018,
+  slopeSlideAngle: 42
 };
 
 const RECONCILE = {
@@ -433,6 +481,18 @@ function applyPixelRatio() {
 }
 
 // Game state
+interface Gun {
+  archetype: 'pistol' | 'smg' | 'rifle' | 'shotgun';
+  rarity: 'common' | 'rare' | 'epic' | 'legendary';
+  dps: number;
+  mag: number;
+  reloadMs: number;
+  fireRate: number;
+  accuracy: number;
+  range: number;
+  seed: string;
+}
+
 interface Player {
   id: string;
   name: string;
@@ -441,7 +501,8 @@ interface Player {
   z: number;
   hp: number;
   maxHp: number;
-  equipped: any;
+  equipped: Gun | null;
+  inventory?: Gun[];
   lives?: number;
   isSpectator?: boolean;
   spectatorUntil?: number;
@@ -449,7 +510,7 @@ interface Player {
 
 interface Mob {
   id: string;
-  type: string;
+  type: EnemyTypeId;
   x: number;
   y: number;
   z: number;
@@ -462,11 +523,38 @@ interface LootDrop {
   x: number;
   y: number;
   z: number;
-  item: any;
+  item: Gun;
 }
 
+interface HelloMessage {
+  type: 'hello';
+  id: string;
+  now?: number;
+  player: Player;
+  difficulty?: Difficulty;
+}
+
+interface SnapshotMessage {
+  type: 'snapshot';
+  difficulty?: Difficulty;
+  players?: Player[];
+  mobs?: Mob[];
+  loot?: LootDrop[];
+}
+
+interface EventMessage {
+  type: 'event';
+  event: string;
+  [key: string]: unknown;
+}
+
+type ServerMessage = HelloMessage | SnapshotMessage | EventMessage;
+
 // Setup renderer
-const canvas = document.querySelector<HTMLCanvasElement>('#c')!;
+const canvas = document.querySelector<HTMLCanvasElement>('#c');
+if (!canvas) {
+  throw new Error('Unable to locate game canvas element (#c) in the DOM');
+}
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -477,7 +565,8 @@ applyPixelRatio();
 
 // Setup scene
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(0xcfe8ff, 220, 820);
+scene.background = new THREE.Color(0x0f1625);
+scene.fog = new THREE.Fog(0x162031, 140, 560);
 
 // Setup camera
 const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 500);
@@ -489,6 +578,8 @@ const damageIndicatorScratch = {
   right: new THREE.Vector3(),
   source: new THREE.Vector3()
 };
+
+const terrainProbe = new THREE.Vector3();
 
 let damageIndicatorElement: HTMLDivElement | null = null;
 let damageIndicatorFadeTimeout: number | null = null;
@@ -589,8 +680,8 @@ function showDamageIndicator(sourcePosition: THREE.Vector3) {
 }
 
 // Lighting
-const dirLight = new THREE.DirectionalLight(0xfff6d3, 4.5);
-dirLight.position.set(32, 72, 12);
+const dirLight = new THREE.DirectionalLight(0xff9455, 5.2);
+dirLight.position.set(42, 80, 28);
 dirLight.castShadow = true;
 dirLight.shadow.camera.left = -40;
 dirLight.shadow.camera.right = 40;
@@ -605,16 +696,21 @@ scene.add(dirLight);
 dirLight.target.position.set(32, 0, 32);
 scene.add(dirLight.target);
 
-const ambLight = new THREE.AmbientLight(0xfff3d0, 1.9);
+const ambLight = new THREE.AmbientLight(0x1c2a3f, 1.6);
 scene.add(ambLight);
 
-const hemiLight = new THREE.HemisphereLight(0xf2f8ff, 0x8b6a42, 1.6);
+const hemiLight = new THREE.HemisphereLight(0x56bfff, 0x2b1a18, 1.9);
 scene.add(hemiLight);
 
-const fillLight = new THREE.DirectionalLight(0xcfe3ff, 1.2);
-fillLight.position.set(-54, 48, -36);
+const fillLight = new THREE.DirectionalLight(0x67afff, 2.8);
+fillLight.position.set(-54, 52, -26);
 fillLight.castShadow = false;
 scene.add(fillLight);
+
+const rimLight = new THREE.PointLight(0xff2d55, 3.2, 120);
+rimLight.position.set(32, 18, 32);
+rimLight.castShadow = false;
+scene.add(rimLight);
 
 // Create world
 const skybox = makeSkybox(scene);
@@ -660,6 +756,7 @@ const scratchColorB = new THREE.Color();
 const scratchColorC = new THREE.Color();
 const scratchColorD = new THREE.Color();
 const scratchColorE = new THREE.Color();
+const scratchColorF = new THREE.Color();
 
 const fillSkyColor = new THREE.Color(0xdde9ff);
 const fillWarmColor = new THREE.Color(0xfff2cc);
@@ -730,9 +827,13 @@ function updateDayNight(deltaMs: number) {
   const skyBottom = scratchColorB.copy(nightSkyBottom)
     .lerp(daySkyBottom, daylight)
     .lerp(dawnSkyBottom, Math.min(1, duskGlow));
+  const skyMid = scratchColorF.copy(nightSkyBottom)
+    .lerp(daySkyTop, daylight * 0.5)
+    .lerp(dawnSkyTop, Math.min(1, duskGlow));
   skybox.uniforms.topColor.value.copy(skyTop);
+  skybox.uniforms.middleColor.value.copy(skyMid);
   skybox.uniforms.bottomColor.value.copy(skyBottom);
-  skybox.uniforms.exponent.value = THREE.MathUtils.lerp(0.75, 0.98, effectiveDaylight);
+  skybox.uniforms.gradientPower.value = THREE.MathUtils.lerp(0.65, 1.15, effectiveDaylight);
 
   if (scene.fog) {
     scene.fog.color.copy(skyBottom);
@@ -760,14 +861,7 @@ if (enablePostProcessing) {
 
 // Shared geometries (create once, reuse many times)
 const geometries = {
-  player: new THREE.BoxGeometry(0.8, 1.8, 0.8),
-  charger: new THREE.BoxGeometry(1.2, 1.2, 1.2),
-  shooter: new THREE.SphereGeometry(0.6, 8, 6),
-  jumper: new THREE.ConeGeometry(0.7, 1.5, 6),
-  sniper: new THREE.CylinderGeometry(0.3, 0.5, 2, 6),
-  tank: new THREE.BoxGeometry(2, 2, 2),
-  swarm: new THREE.TetrahedronGeometry(0.5, 0),
-  loot: new THREE.OctahedronGeometry(0.4)
+  player: new THREE.BoxGeometry(0.8, 1.8, 0.8)
 };
 
 // Shared materials
@@ -806,86 +900,53 @@ const materials = {
   }
 };
 
-const mobPalettes: Record<string, { base: number; accent: number; glow: number }> = {
-  charger: { base: 0x913232, accent: 0xffc857, glow: 0xff6644 },
-  shooter: { base: 0x2c3e50, accent: 0x4ca1ff, glow: 0x9bdcff },
-  jumper: { base: 0x1f6f50, accent: 0x3ddc97, glow: 0xb9ffcd },
-  sniper: { base: 0x332e5c, accent: 0xb796ff, glow: 0xded0ff },
-  tank:   { base: 0x4f4f4f, accent: 0xd9d9d9, glow: 0xffd166 },
-  swarm:  { base: 0x7b2cbf, accent: 0xff70a6, glow: 0xffd6ff },
-  default: { base: 0x3a3a3a, accent: 0xaaaaaa, glow: 0xffffff }
+const mobPalettes: Record<EnemyTypeId | 'default', { base: number; accent: number; glow: number }> = {
+  grunt: { base: 0x2c303d, accent: 0xff5a31, glow: 0xff2d55 },
+  sniper: { base: 0x2f3145, accent: 0xd6a2ff, glow: 0xf0c3ff },
+  heavy: { base: 0x2a292d, accent: 0xff933b, glow: 0xffce4a },
+  default: { base: 0x30343c, accent: 0x5fa0ff, glow: 0x9bd2ff }
 };
 
-const MOB_BASE_SCALE: Record<string, number> = {
-  charger: 2.4,
-  shooter: 2.0,
-  jumper: 2.2,
-  sniper: 2.6,
-  tank: 2.8,
-  swarm: 1.9,
-  default: 2.1
-};
+// Thick outline via inverted hull on BackSide
+function addInvertedOutline(mesh: THREE.Mesh, scaleFactor = 1.08) {
+  const geom = (mesh.geometry as THREE.BufferGeometry).clone();
+  const outlineMat = new THREE.MeshBasicMaterial({
+    color: 0x000000,
+    side: THREE.BackSide,
+    depthWrite: false
+  });
+  const outline = new THREE.Mesh(geom, outlineMat);
+  outline.name = 'outlineHull';
+  outline.scale.set(scaleFactor, scaleFactor, scaleFactor);
+  // Place outline as child so it follows transforms
+  mesh.add(outline);
+}
 
-const mobPrototypes = new Map<string, THREE.Group>();
-const mobFallbackPrototypes = new Map<string, THREE.Group>();
-const voxelLoader = VoxelModelLoader.getInstance();
+// MOB_TARGET_VISUAL_HEIGHT removed - no longer needed after fixing height normalization
 
-// Preload voxel models for enemies
+const mobPrototypes = new Map<EnemyTypeId, THREE.Group>();
+
+// Procedurally build all enemy archetypes up front (no external voxel assets)
 async function preloadEnemyModels() {
-  const modelPaths = [
-    { type: 'sniper', path: '/models/enemies/sniper/mechSniper.obj', format: 'obj', scale: 0.035 },
-    { type: 'tank', path: '/models/enemies/tank/ShockTrooper.obj', format: 'obj', scale: 0.04 },
-    { type: 'shooter', path: '/models/enemies/skeletons/shooter.vox', format: 'vox', scale: 0.06 },
-    { type: 'swarm', path: '/models/enemies/skeletons/swarm.vox', format: 'vox', scale: 0.05 },
-    { type: 'charger', path: '/models/enemies/chicken/ayam.dae', format: 'dae', scale: 0.045 },
-    { type: 'jumper', path: '/models/enemies/skeletons/charger.vox', format: 'vox', scale: 0.055 }
-  ];
+  const builders: Record<EnemyTypeId, () => THREE.Group> = {
+    grunt: buildGruntPrototype,
+    sniper: buildSniperPrototype,
+    heavy: buildHeavyPrototype
+  };
 
-  mobFallbackPrototypes.set('sniper', buildSniperPrototype());
-  mobFallbackPrototypes.set('tank', buildTankPrototype());
-  mobFallbackPrototypes.set('shooter', buildShooterPrototype());
-  mobFallbackPrototypes.set('swarm', buildSwarmPrototype());
-  mobFallbackPrototypes.set('charger', buildChargerPrototype());
-  mobFallbackPrototypes.set('jumper', buildJumperPrototype());
-
-  for (const model of modelPaths) {
-    try {
-      const voxelModel = await voxelLoader.loadModel(model.path, model.format as 'obj' | 'dae' | 'vox', model.scale);
-      const group = new THREE.Group();
-      group.add(voxelModel);
-
-      // Set base scale based on enemy type
-      switch(model.type) {
-        case 'sniper': group.userData.baseScale = 1.35; break;
-        case 'tank': group.userData.baseScale = 1.65; break;
-        case 'shooter': group.userData.baseScale = 1.25; break;
-        case 'swarm': group.userData.baseScale = 1.1; break;
-        case 'charger': group.userData.baseScale = 1.4; break;
-        case 'jumper': group.userData.baseScale = 1.3; break;
-      }
-
-      applyMobPostProcess(group, model.type);
-      mobPrototypes.set(model.type, group);
-      console.log(`Loaded voxel model for ${model.type}`);
-    } catch (error) {
-      console.warn(`Failed to load voxel model for ${model.type}, using procedural geometry`, error);
-      const fallback = mobFallbackPrototypes.get(model.type);
-      if (fallback) {
-        mobPrototypes.set(model.type, fallback);
-      }
-    }
+  for (const [type, build] of Object.entries(builders) as Array<[EnemyTypeId, () => THREE.Group]>) {
+    const group = build();
+    mobPrototypes.set(type, group);
   }
 }
 
-function applyMobPostProcess(group: THREE.Group, type: string) {
+// Apply shared styling cues (glow hull + telegraph) so every enemy feels cohesive.
+function applyMobPostProcess(group: THREE.Group, type: EnemyTypeId | 'default') {
   const tempVec = new THREE.Vector3();
-  const glowColors: Record<string, number> = {
-    charger: 0xf26d4c,
-    shooter: 0x6ad9ff,
-    jumper: 0x76ff9f,
+  const glowColors: Record<EnemyTypeId | 'default', number> = {
+    grunt: 0xf26d4c,
     sniper: 0xe2a9ff,
-    tank: 0xffd166,
-    swarm: 0xff74c6,
+    heavy: 0xffd166,
     default: 0xffffff
   };
 
@@ -933,7 +994,8 @@ function applyMobPostProcess(group: THREE.Group, type: string) {
     }
   });
 
-  const targetBaseScale = MOB_BASE_SCALE[type] ?? MOB_BASE_SCALE.default;
+  const baseScaleSource = type === 'default' ? ENEMY_TYPES.grunt : ENEMY_TYPES[type as EnemyTypeId] ?? ENEMY_TYPES.grunt;
+  const targetBaseScale = baseScaleSource.scale;
 
   if (!primaryMesh) {
     group.userData.baseScale = targetBaseScale;
@@ -952,14 +1014,14 @@ function applyMobPostProcess(group: THREE.Group, type: string) {
     depthWrite: false
   });
   const glowMesh = new THREE.Mesh(sourceGeometry.clone(), glowMaterial);
-  glowMesh.scale.setScalar(1.28);
+  glowMesh.scale.setScalar(1.35);
   glowMesh.name = 'mobGlowHull';
   targetMesh.add(glowMesh);
 
   const rimMaterial = new THREE.MeshBasicMaterial({
     color: 0xffffff,
     transparent: true,
-    opacity: 0.22,
+    opacity: 0.35,
     side: THREE.FrontSide,
     depthWrite: false
   });
@@ -968,12 +1030,36 @@ function applyMobPostProcess(group: THREE.Group, type: string) {
   rimMesh.name = 'mobRimHull';
   targetMesh.add(rimMesh);
 
-  group.userData.baseScale = targetBaseScale;
+  // Telegraph ring keeps combat readable; animation driven in the render loop.
+  const telegraphRing = new THREE.Mesh(
+    new THREE.RingGeometry(0.5, 0.7, 40),
+    new THREE.MeshBasicMaterial({
+      color: glowColors[type] ?? glowColors.default,
+      transparent: true,
+      opacity: 0.32,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    })
+  );
+  telegraphRing.name = 'mobTelegraph';
+  telegraphRing.rotation.x = -Math.PI / 2;
+  telegraphRing.position.y = 0.05;
+  telegraphRing.scale.setScalar(targetBaseScale * WORLD_SCALE.MOB_WIDTH * 1.2);
+  group.add(telegraphRing);
+
+  const bounding = new THREE.Box3().setFromObject(group);
+  const rawHeight = Math.max(0.001, bounding.max.y - bounding.min.y);
+  const desiredHeight = baseScaleSource.height;
+  const normalization = desiredHeight / rawHeight;
+
+  group.scale.setScalar(normalization);
+  group.userData.baseScale = normalization;
   group.userData.mobType = type;
   group.userData.isMobRoot = true;
 }
 
-function clonePrototype(group: THREE.Group, type: string): THREE.Object3D {
+// Clone archetype meshes and rehydrate materials while preserving our authored scale.
+function clonePrototype(group: THREE.Group, type: EnemyTypeId): THREE.Object3D {
   const clone = group.clone(true);
   clone.traverse(obj => {
     if ((obj as THREE.Mesh).isMesh) {
@@ -988,374 +1074,325 @@ function clonePrototype(group: THREE.Group, type: string): THREE.Object3D {
     }
   });
 
-  const baseScale = group.userData.baseScale ?? MOB_BASE_SCALE[type] ?? MOB_BASE_SCALE.default;
+  // IMPORTANT: Do not height-normalize here.
+  // Previously we measured the already-scaled object and applied a "correction"
+  // toward MOB_TARGET_VISUAL_HEIGHT, which compounded the scale and shrank enemies
+  // to microscopic sizes. We now use the baseScale directly for predictable sizing.
+  // The snapshot loop re-applies userData.baseScale to preserve consistency.
+  const baseScale = group.userData.baseScale ?? ENEMY_TYPES[type]?.scale ?? ENEMY_TYPES.grunt.scale;
+  clone.scale.setScalar(baseScale);
+
+  // Do NOT height-normalize here. Previous logic divided by the measured height
+  // of the already scaled mesh, shrinking enemies to microscopic size. Keep the
+  // baseScale authoritative so gameplay, telegraphs, and hitboxes stay in sync.
   clone.userData.baseScale = baseScale;
   clone.userData.isMobRoot = true;
   clone.userData.mobType = type;
   clone.userData.animPhase = Math.random() * Math.PI * 2;
-  clone.scale.setScalar(baseScale);
+
   return clone;
 }
 
-function buildChargerPrototype(): THREE.Group {
-  const palette = mobPalettes.charger;
+function buildGruntPrototype(): THREE.Group {
+  const palette = mobPalettes.grunt;
   const group = new THREE.Group();
 
-  const torso = new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.2, 1.4), new THREE.MeshStandardMaterial({
-    color: palette.base,
-    metalness: 0.25,
-    roughness: 0.45
-  }));
-  torso.position.y = 0.6;
-  torso.position.x = 0.25;
+  const chassis = new THREE.MeshStandardMaterial({ color: palette.base, roughness: 0.55, metalness: 0.35 });
+  const trim = new THREE.MeshStandardMaterial({ color: palette.accent, roughness: 0.4, metalness: 0.45 });
+  const glow = new THREE.MeshStandardMaterial({
+    color: palette.glow,
+    emissive: new THREE.Color(palette.glow),
+    emissiveIntensity: 1.6,
+    metalness: 0.2,
+    roughness: 0.25
+  });
+
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(1.6, 1.8, 1.2), chassis);
+  torso.position.set(0, 1.3, 0);
+  addInvertedOutline(torso);
   group.add(torso);
 
-  const head = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.8, 1.0), new THREE.MeshStandardMaterial({
-    color: palette.accent,
-    metalness: 0.3,
-    roughness: 0.35
-  }));
-  head.position.set(1.0, 1.1, 0);
+  const furnace = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.5, 0.1), glow);
+  furnace.position.set(0, 1.35, 0.7);
+  addInvertedOutline(furnace, 1.02);
+  group.add(furnace);
+
+  const pauldrons = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.4, 0.9), trim);
+  pauldrons.position.set(0, 1.95, 0);
+  addInvertedOutline(pauldrons);
+  group.add(pauldrons);
+
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.8, 0.9), chassis);
+  head.position.set(0, 2.3, 0);
+  addInvertedOutline(head);
   group.add(head);
 
-  const hornMat = new THREE.MeshStandardMaterial({
-    color: palette.glow,
-    emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 1.1,
-    metalness: 0.1,
-    roughness: 0.25
-  });
-  const hornGeometry = new THREE.BoxGeometry(0.25, 0.25, 0.9);
-  const leftHorn = new THREE.Mesh(hornGeometry, hornMat);
-  leftHorn.position.set(1.45, 1.35, 0.4);
-  leftHorn.rotation.z = -0.35;
-  group.add(leftHorn);
-  const rightHorn = leftHorn.clone();
-  rightHorn.position.z = -0.4;
-  rightHorn.rotation.z = 0.35;
-  group.add(rightHorn);
-
-  const shoulder = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.7, 1.6), new THREE.MeshStandardMaterial({
-    color: palette.base,
-    metalness: 0.2,
-    roughness: 0.5
-  }));
-  shoulder.position.set(0.45, 1.0, 0);
-  group.add(shoulder);
-
-  const plate = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.3, 1.2), new THREE.MeshStandardMaterial({
-    color: palette.accent,
-    metalness: 0.5,
-    roughness: 0.4
-  }));
-  plate.position.set(0.2, 0.95, 0);
-  group.add(plate);
-
-  const legMaterial = new THREE.MeshStandardMaterial({
-    color: 0x2f1f12,
-    metalness: 0.1,
-    roughness: 0.6
-  });
-  const legGeometry = new THREE.BoxGeometry(0.35, 0.8, 0.5);
-  const legOffsets: Array<[number, number]> = [
-    [-0.4, 0.6],
-    [-0.4, -0.6],
-    [0.8, 0.65],
-    [0.8, -0.65]
-  ];
-  legOffsets.forEach(offset => {
-    const leg = new THREE.Mesh(legGeometry, legMaterial);
-    leg.position.set(offset[0], 0.4, offset[1]);
-    group.add(leg);
-  });
-
-  const tail = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.4, 0.8), new THREE.MeshStandardMaterial({
-    color: palette.base,
-    metalness: 0.2,
-    roughness: 0.45
-  }));
-  tail.position.set(-0.9, 0.75, 0);
-  group.add(tail);
-
-  group.userData.baseScale = 1.9;
-  applyMobPostProcess(group, 'charger');
-  return group;
-}
-
-function buildShooterPrototype(): THREE.Group {
-  const palette = mobPalettes.shooter;
-  const group = new THREE.Group();
-
-  const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.4, 1.4), new THREE.MeshStandardMaterial({
-    color: palette.base,
-    metalness: 0.55,
-    roughness: 0.4
-  }));
-  chassis.position.y = 0.55;
-  group.add(chassis);
-
-  const core = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.9, 0.9), new THREE.MeshStandardMaterial({
-    color: palette.accent,
-    emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.9,
-    metalness: 0.2,
-    roughness: 0.25
-  }));
-  core.position.y = 0.85;
-  group.add(core);
-
-  const barrelMaterial = new THREE.MeshStandardMaterial({
-    color: 0x15263f,
-    metalness: 0.6,
-    roughness: 0.35
-  });
-  const barrelGeometry = new THREE.BoxGeometry(0.3, 0.3, 1.4);
-  for (let i = 0; i < 4; i++) {
-    const barrel = new THREE.Mesh(barrelGeometry, barrelMaterial);
-    barrel.position.y = 0.9;
-    barrel.rotation.y = (Math.PI / 2) * i;
-    barrel.position.x = Math.cos((Math.PI / 2) * i) * 0.8;
-    barrel.position.z = Math.sin((Math.PI / 2) * i) * 0.8;
-    group.add(barrel);
-  }
-
-  const thrusterMaterial = new THREE.MeshStandardMaterial({
-    color: palette.glow,
-    emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.85,
-    metalness: 0.15,
-    roughness: 0.2
-  });
-  const thrusterGeometry = new THREE.BoxGeometry(0.4, 0.3, 0.4);
-  for (let i = 0; i < 4; i++) {
-    const thruster = new THREE.Mesh(thrusterGeometry, thrusterMaterial);
-    thruster.position.set(Math.cos((Math.PI / 2) * i) * 0.9, 0.2, Math.sin((Math.PI / 2) * i) * 0.9);
-    group.add(thruster);
-  }
-
-  group.userData.baseScale = 1.7;
-  applyMobPostProcess(group, 'shooter');
-  return group;
-}
-
-function buildJumperPrototype(): THREE.Group {
-  const palette = mobPalettes.jumper;
-  const group = new THREE.Group();
-
-  const abdomen = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.6, 1.9), new THREE.MeshStandardMaterial({
-    color: palette.base,
-    metalness: 0.3,
-    roughness: 0.4
-  }));
-  abdomen.position.y = 0.6;
-  group.add(abdomen);
-
-  const thorax = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.7, 1.0), new THREE.MeshStandardMaterial({
-    color: palette.accent,
-    metalness: 0.25,
-    roughness: 0.35
-  }));
-  thorax.position.set(0.6, 0.95, 0);
-  group.add(thorax);
-
-  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.4, 0.8), new THREE.MeshStandardMaterial({
-    color: palette.glow,
-    emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.8,
-    metalness: 0.1,
-    roughness: 0.2
-  }));
-  visor.position.set(1.2, 0.9, 0);
+  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.25, 0.1), glow);
+  visor.position.set(0, 2.3, 0.55);
+  addInvertedOutline(visor);
   group.add(visor);
 
-  const legMaterial = new THREE.MeshStandardMaterial({
-    color: 0x264a33,
-    metalness: 0.2,
-    roughness: 0.55
+  const hornGeom = new THREE.BoxGeometry(0.25, 0.25, 1.1);
+  const hornL = new THREE.Mesh(hornGeom, glow);
+  hornL.position.set(0.9, 2.55, 0.45);
+  hornL.rotation.z = -0.2;
+  addInvertedOutline(hornL);
+  group.add(hornL);
+  const hornR = hornL.clone();
+  hornR.position.x = -0.9;
+  hornR.rotation.z = 0.2;
+  group.add(hornR);
+
+  const upperArmGeo = new THREE.BoxGeometry(0.6, 0.8, 0.6);
+  const foreArmGeo = new THREE.BoxGeometry(0.6, 0.7, 0.6);
+  const fistGeo = new THREE.BoxGeometry(0.7, 0.6, 0.7);
+  [-1, 1].forEach(side => {
+    const upper = new THREE.Mesh(upperArmGeo, chassis);
+    upper.position.set(side * 1.25, 1.6, 0);
+    addInvertedOutline(upper);
+    group.add(upper);
+
+    const lower = new THREE.Mesh(foreArmGeo, chassis);
+    lower.position.set(side * 1.25, 1.0, 0.15);
+    addInvertedOutline(lower);
+    group.add(lower);
+
+    const fist = new THREE.Mesh(fistGeo, trim);
+    fist.position.set(side * 1.25, 0.55, 0.3);
+    addInvertedOutline(fist);
+    group.add(fist);
+
+    const flame = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.5, 0.4), glow);
+    flame.position.set(side * 1.25, 0.2, 0.3);
+    addInvertedOutline(flame, 1.05);
+    group.add(flame);
   });
-  const legGeometry = new THREE.BoxGeometry(0.25, 0.25, 1.6);
-  for (let i = 0; i < 6; i++) {
-    const leg = new THREE.Mesh(legGeometry, legMaterial);
-    const angle = (Math.PI / 3) * i;
-    leg.position.set(Math.cos(angle) * 0.9, 0.4, Math.sin(angle) * 0.9);
-    leg.rotation.y = angle;
-    leg.rotation.z = (i % 2 === 0 ? 1 : -1) * 0.35;
+
+  const pack = new THREE.Mesh(new THREE.BoxGeometry(1.6, 1.0, 0.9), chassis);
+  pack.position.set(0, 1.45, -0.8);
+  addInvertedOutline(pack);
+  group.add(pack);
+
+  const thrusterGeo = new THREE.BoxGeometry(0.45, 0.95, 0.45);
+  [-0.65, 0.65].forEach(offset => {
+    const thruster = new THREE.Mesh(thrusterGeo, trim);
+    thruster.position.set(offset, 0.95, -0.95);
+    addInvertedOutline(thruster);
+    group.add(thruster);
+
+    const exhaust = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.85, 0.35), glow);
+    exhaust.position.set(offset, 0.45, -0.95);
+    addInvertedOutline(exhaust, 1.04);
+    group.add(exhaust);
+  });
+
+  const legGeo = new THREE.BoxGeometry(0.75, 1.45, 0.75);
+  [-0.6, 0.6].forEach(offset => {
+    const leg = new THREE.Mesh(legGeo, chassis);
+    leg.position.set(offset, 0.7, 0);
+    addInvertedOutline(leg);
     group.add(leg);
-  }
+    const boot = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.4, 1.2), trim);
+    boot.position.set(offset, 0, 0.2);
+    addInvertedOutline(boot);
+    group.add(boot);
+  });
 
-  const booster = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.4, 0.5), new THREE.MeshStandardMaterial({
-    color: palette.glow,
-    emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.9
-  }));
-  booster.position.set(-0.7, 0.9, 0);
-  group.add(booster);
-
-  group.userData.baseScale = 1.6;
-  applyMobPostProcess(group, 'jumper');
+  applyMobPostProcess(group, 'grunt');
   return group;
 }
 
 function buildSniperPrototype(): THREE.Group {
+  // SNIPER CUBE - marksman with ghillie plates (blocky)
   const palette = mobPalettes.sniper;
   const group = new THREE.Group();
 
-  const tripodMaterial = new THREE.MeshStandardMaterial({ color: 0x1e1a2f, metalness: 0.35, roughness: 0.55 });
-  const legGeometry = new THREE.BoxGeometry(0.25, 1.4, 0.25);
-  for (let i = 0; i < 3; i++) {
-    const leg = new THREE.Mesh(legGeometry, tripodMaterial);
-    const angle = (Math.PI * 2 * i) / 3;
-    leg.position.set(Math.cos(angle) * 0.7, 0.7, Math.sin(angle) * 0.7);
-    leg.rotation.y = angle;
-    group.add(leg);
-  }
-
-  const spine = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.2, 0.6), new THREE.MeshStandardMaterial({
+  const camoA = new THREE.MeshStandardMaterial({
     color: palette.base,
-    metalness: 0.45,
-    roughness: 0.35
-  }));
-  spine.position.y = 1.6;
-  group.add(spine);
-
-  const head = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.7, 0.9), new THREE.MeshStandardMaterial({
-    color: palette.accent,
     metalness: 0.3,
-    roughness: 0.3
-  }));
-  head.position.y = 2.6;
-  group.add(head);
-
-  const scope = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.35, 0.35), new THREE.MeshStandardMaterial({
+    roughness: 0.55
+  });
+  const camoB = new THREE.MeshStandardMaterial({
+    color: palette.accent,
+    metalness: 0.25,
+    roughness: 0.6
+  });
+  const laserMat = new THREE.MeshStandardMaterial({
     color: palette.glow,
     emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.9,
-    metalness: 0.2,
-    roughness: 0.2
-  }));
-  scope.position.set(0.0, 2.8, 0);
-  group.add(scope);
-
-  const antenna = new THREE.Mesh(new THREE.BoxGeometry(0.15, 1.4, 0.15), new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    emissive: new THREE.Color(0xbcd7ff),
-    emissiveIntensity: 0.6
-  }));
-  antenna.position.set(-0.35, 2.9, 0);
-  group.add(antenna);
-
-  group.userData.baseScale = 1.8;
-  applyMobPostProcess(group, 'sniper');
-  return group;
-}
-
-function buildTankPrototype(): THREE.Group {
-  const palette = mobPalettes.tank;
-  const group = new THREE.Group();
-
-  const trackMaterial = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, metalness: 0.2, roughness: 0.65 });
-  const trackGeometry = new THREE.BoxGeometry(2.2, 0.6, 0.6);
-  const leftTrack = new THREE.Mesh(trackGeometry, trackMaterial);
-  leftTrack.position.set(0, 0.3, 0.9);
-  group.add(leftTrack);
-  const rightTrack = leftTrack.clone();
-  rightTrack.position.z = -0.9;
-  group.add(rightTrack);
-
-  const hull = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.9, 1.6), new THREE.MeshStandardMaterial({
-    color: palette.base,
-    metalness: 0.45,
-    roughness: 0.45
-  }));
-  hull.position.y = 0.95;
-  group.add(hull);
-
-  const turret = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.7, 1.2), new THREE.MeshStandardMaterial({
-    color: palette.accent,
-    metalness: 0.55,
-    roughness: 0.35
-  }));
-  turret.position.y = 1.5;
-  group.add(turret);
-
-  const cannon = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.35, 0.35), new THREE.MeshStandardMaterial({
-    color: palette.glow,
-    emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.7,
-    metalness: 0.3,
-    roughness: 0.25
-  }));
-  cannon.position.set(1.3, 1.55, 0);
-  group.add(cannon);
-
-  const exhaust = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), new THREE.MeshStandardMaterial({
-    color: 0xff9455,
-    emissive: new THREE.Color(0xff9455),
-    emissiveIntensity: 0.8
-  }));
-  exhaust.position.set(-0.9, 1.4, 0);
-  group.add(exhaust);
-
-  group.userData.baseScale = 2.0;
-  applyMobPostProcess(group, 'tank');
-  return group;
-}
-
-function buildSwarmPrototype(): THREE.Group {
-  const palette = mobPalettes.swarm;
-  const group = new THREE.Group();
-
-  const shardMaterial = new THREE.MeshStandardMaterial({
-    color: palette.base,
-    emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 0.6,
+    emissiveIntensity: 1.0,
     metalness: 0.2,
     roughness: 0.3
   });
 
-  for (let i = 0; i < 7; i++) {
-    const cube = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6, 0.6), shardMaterial);
-    cube.position.set((Math.random() - 0.5) * 1.2, Math.random() * 0.8 + 0.2, (Math.random() - 0.5) * 1.2);
-    cube.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
-    group.add(cube);
+  // Body stack
+  const pelvis = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.4, 0.5), camoA);
+  pelvis.position.set(0, 0.6, 0);
+  addInvertedOutline(pelvis);
+  group.add(pelvis);
+
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.8, 1.0, 0.6), camoB);
+  torso.position.set(0, 1.2, 0);
+  addInvertedOutline(torso);
+  group.add(torso);
+
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6, 0.6), camoA);
+  head.position.set(0, 1.8, 0);
+  addInvertedOutline(head);
+  group.add(head);
+
+  // Ghillie plates (simple small boxes)
+  const plates: Array<[number, number, number]> = [
+    [-0.35, 1.45, 0.2], [0.35, 1.35, 0.1], [0.0, 1.55, -0.2], [0.2, 1.1, 0.25], [-0.2, 1.0, -0.25]
+  ];
+  for (const [px, py, pz] of plates) {
+    const plate = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.15, 0.3), camoA);
+    plate.position.set(px, py, pz);
+    addInvertedOutline(plate);
+    group.add(plate);
   }
 
-  const nucleus = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), new THREE.MeshStandardMaterial({
+  // Arms
+  const armGeom = new THREE.BoxGeometry(0.22, 0.9, 0.22);
+  const leftArm = new THREE.Mesh(armGeom, camoB);
+  leftArm.position.set(-0.6, 1.25, 0.05);
+  addInvertedOutline(leftArm);
+  group.add(leftArm);
+  const rightArm = new THREE.Mesh(armGeom, camoB);
+  rightArm.position.set(0.6, 1.25, 0.05);
+  addInvertedOutline(rightArm);
+  group.add(rightArm);
+
+  // Legs
+  const legGeom = new THREE.BoxGeometry(0.28, 0.9, 0.28);
+  const leftLeg = new THREE.Mesh(legGeom, camoA);
+  leftLeg.position.set(-0.25, 0.45, 0.05);
+  addInvertedOutline(leftLeg);
+  group.add(leftLeg);
+  const rightLeg = new THREE.Mesh(legGeom, camoA);
+  rightLeg.position.set(0.25, 0.45, 0.05);
+  addInvertedOutline(rightLeg);
+  group.add(rightLeg);
+
+  // Long rifle (boxy)
+  const rifleBody = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.12, 0.16), camoB);
+  rifleBody.position.set(0.2, 1.35, 0.4);
+  addInvertedOutline(rifleBody);
+  rifleBody.name = 'weapon';
+  group.add(rifleBody);
+
+  const rifleBarrel = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.08, 0.08), camoA);
+  rifleBarrel.position.set(1.0, 1.35, 0.4);
+  addInvertedOutline(rifleBarrel);
+  group.add(rifleBarrel);
+
+  // Laser box
+  const laser = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.05, 0.05), laserMat);
+  laser.position.set(1.0, 1.42, 0.52);
+  addInvertedOutline(laser);
+  group.add(laser);
+
+  applyMobPostProcess(group, 'sniper');
+  return group;
+}
+
+function buildHeavyPrototype(): THREE.Group {
+  // RIOT SHIELD - defensive unit (blocky)
+  const palette = mobPalettes.heavy;
+  const group = new THREE.Group();
+
+  const armor = new THREE.MeshStandardMaterial({
+    color: palette.base,
+    metalness: 0.25,
+    roughness: 0.7
+  });
+  const hazard = new THREE.MeshStandardMaterial({
+    color: palette.accent,
+    metalness: 0.4,
+    roughness: 0.5
+  });
+  const redGlow = new THREE.MeshStandardMaterial({
     color: palette.glow,
     emissive: new THREE.Color(palette.glow),
-    emissiveIntensity: 1.0,
-    metalness: 0.1,
-    roughness: 0.2
-  }));
-  nucleus.position.y = 0.8;
-  group.add(nucleus);
+    emissiveIntensity: 0.9,
+    metalness: 0.15,
+    roughness: 0.35
+  });
 
-  group.userData.baseScale = 1.4;
-  applyMobPostProcess(group, 'swarm');
+  // Body
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(1.0, 1.3, 0.6), armor);
+  torso.position.set(0, 1.0, 0);
+  addInvertedOutline(torso);
+  group.add(torso);
+
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6, 0.6), armor);
+  head.position.set(0, 1.7, 0);
+  addInvertedOutline(head);
+  group.add(head);
+
+  // Shield panel
+  const shield = new THREE.Mesh(new THREE.BoxGeometry(1.4, 1.8, 0.15), armor);
+  shield.position.set(0, 1.1, 0.45);
+  shield.name = 'shield';
+  addInvertedOutline(shield);
+  group.add(shield);
+
+  // Viewport slit
+  const slit = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.12, 0.05), redGlow);
+  slit.position.set(0, 1.5, 0.54);
+  addInvertedOutline(slit);
+  group.add(slit);
+
+  // Hazard stripes (rect boxes)
+  const stripe1 = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.1, 0.02), hazard);
+  stripe1.position.set(0, 0.7, 0.54);
+  stripe1.rotation.z = 0.2;
+  addInvertedOutline(stripe1);
+  group.add(stripe1);
+
+  const stripe2 = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.1, 0.02), hazard);
+  stripe2.position.set(0, 0.4, 0.54);
+  stripe2.rotation.z = 0.2;
+  addInvertedOutline(stripe2);
+  group.add(stripe2);
+
+  // Arms and legs
+  const armGeom = new THREE.BoxGeometry(0.25, 0.9, 0.25);
+  const leftArm = new THREE.Mesh(armGeom, armor);
+  leftArm.position.set(-0.7, 1.2, 0.15);
+  addInvertedOutline(leftArm);
+  group.add(leftArm);
+
+  const rightArm = new THREE.Mesh(armGeom, armor);
+  rightArm.position.set(0.7, 1.2, 0.15);
+  addInvertedOutline(rightArm);
+  group.add(rightArm);
+
+  const legGeom = new THREE.BoxGeometry(0.35, 1.0, 0.35);
+  const leftLeg = new THREE.Mesh(legGeom, armor);
+  leftLeg.position.set(-0.3, 0.5, 0.05);
+  addInvertedOutline(leftLeg);
+  group.add(leftLeg);
+
+  const rightLeg = new THREE.Mesh(legGeom, armor);
+  rightLeg.position.set(0.3, 0.5, 0.05);
+  addInvertedOutline(rightLeg);
+  group.add(rightLeg);
+
+  // Baton holster (block)
+  const baton = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.12, 0.12), hazard);
+  baton.position.set(0.6, 1.0, -0.35);
+  addInvertedOutline(baton);
+  group.add(baton);
+
+  applyMobPostProcess(group, 'heavy');
   return group;
 }
 
-function buildDefaultPrototype(): THREE.Group {
-  const palette = mobPalettes.default;
-  const group = new THREE.Group();
-  const mesh = new THREE.Mesh(new THREE.DodecahedronGeometry(0.6, 0), new THREE.MeshStandardMaterial({
-    color: palette.base,
-    metalness: 0.3,
-    roughness: 0.5
-  }));
-  group.add(mesh);
-  group.userData.baseScale = 1;
-  return group;
-}
-
-const mobPrototypeFactories: Record<string, () => THREE.Group> = {
-  charger: buildChargerPrototype,
-  shooter: buildShooterPrototype,
-  jumper: buildJumperPrototype,
+const mobPrototypeFactories: Record<EnemyTypeId, () => THREE.Group> = {
+  grunt: buildGruntPrototype,
   sniper: buildSniperPrototype,
-  tank: buildTankPrototype,
-  swarm: buildSwarmPrototype,
-  default: buildDefaultPrototype
+  heavy: buildHeavyPrototype
 };
 
 function disposeObject(obj: THREE.Object3D) {
@@ -1377,18 +1414,21 @@ function disposeObject(obj: THREE.Object3D) {
   });
 }
 
-function createMobModel(type: string): THREE.Object3D {
-  const key = mobPrototypeFactories[type] ? type : 'default';
-  let prototype = mobPrototypes.get(type);
+function createMobModel(type: EnemyTypeId): THREE.Object3D {
+  const key: EnemyTypeId = mobPrototypeFactories[type] ? type : 'grunt';
+  let prototype = mobPrototypes.get(key);
 
   if (!prototype) {
-    prototype = mobPrototypes.get(key) ?? mobFallbackPrototypes.get(key);
+    const builder = mobPrototypeFactories[key];
+    if (builder) {
+      prototype = builder();
+      mobPrototypes.set(key, prototype);
+    }
   }
 
   if (!prototype) {
-    prototype = mobPrototypeFactories[key]();
-    applyMobPostProcess(prototype, key);
-    mobPrototypes.set(key, prototype);
+    prototype = buildGruntPrototype();
+    mobPrototypes.set('grunt', prototype);
   }
 
   return clonePrototype(prototype, key);
@@ -1513,7 +1553,8 @@ me.visible = false; // Hide in first-person view
 scene.add(me);
 
 // Other players and entities
-const players = new Map<string, THREE.Object3D>();
+type RemotePlayerMesh = THREE.Object3D & { equipped?: Gun | null };
+const players = new Map<string, RemotePlayerMesh>();
 const mobs = new Map<string, THREE.Object3D>();
 const lootDrops = new Map<string, THREE.Object3D>();
 
@@ -1589,8 +1630,12 @@ function createFlashTexture(): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
   canvas.width = 128;
   canvas.height = 128;
-  const ctx = canvas.getContext('2d')!;
-
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    console.warn('Unable to create muzzle flash texture; returning blank canvas');
+    return canvas;
+  }
+  
   // Create star-burst pattern
   const rays = 8;
   const centerX = 64;
@@ -1640,7 +1685,11 @@ function createHitMarker(x: number, y: number, z: number, damage: number, crit: 
   const canvas = document.createElement('canvas');
   canvas.width = 256;
   canvas.height = 128;
-  const ctx = canvas.getContext('2d')!;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    console.warn('Unable to draw hit marker; missing 2D rendering context');
+    return;
+  }
 
   // Add glow effect for critical hits
   if (crit) {
@@ -1814,9 +1863,11 @@ function createImpactParticles(x: number, y: number, z: number) {
 // WebSocket connection
 let pid = crypto.randomUUID();
 let myPlayer: Player | null = null;
-let inventory: any[] = [];
+let inventory: Gun[] = [];
 let kills = 0;
 let lives = 3;
+let sendInputIntervalId: number | null = null;
+let reconnectTimeout: number | null = null;
 
 // Client-side prediction
 let localPosition = { x: 32, y: 10, z: 32 };
@@ -1831,6 +1882,11 @@ const entityStates = new Map<string, {
 }>();
 
 function connect() {
+  if (reconnectTimeout !== null) {
+    window.clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
   // For local development, connect to localhost:8787
   // For production, use the actual worker URL
   const wsBase = API_BASE.replace(/^http/, 'ws');
@@ -1839,7 +1895,20 @@ function connect() {
   ws = new WebSocket(wsUrl);
 
   ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
+    let parsed: unknown;
+    try {
+      parsed = typeof ev.data === 'string' ? JSON.parse(ev.data) : JSON.parse(String(ev.data));
+    } catch (error) {
+      console.warn('Failed to parse message from server', { error, data: ev.data });
+      return;
+    }
+
+    if (!parsed || typeof parsed !== 'object' || typeof (parsed as { type?: unknown }).type !== 'string') {
+      console.warn('Ignoring unsupported server message', parsed);
+      return;
+    }
+
+    const msg = parsed as ServerMessage;
 
     if (msg.type === 'hello') {
       trackEvent('session_start', { difficulty: msg.difficulty ?? currentDifficulty });
@@ -1847,26 +1916,30 @@ function connect() {
       myPlayer = msg.player;
 
       // Update inventory if player has items
-      if (msg.player && msg.player.inventory) {
-        inventory = msg.player.inventory;
+      if (Array.isArray(msg.player?.inventory)) {
+        inventory = msg.player.inventory.filter(isGun);
         console.log('Inventory updated:', inventory);
         updateInventoryUI();
       }
 
-      if (typeof msg.difficulty === 'string') {
-        updateDifficultyUI(msg.difficulty as Difficulty);
+      if (isDifficulty(msg.difficulty)) {
+        updateDifficultyUI(msg.difficulty);
       }
 
-      document.getElementById('room')!.textContent = 'lobby';
+      if (roomLabel) {
+        roomLabel.textContent = 'lobby';
+      }
     }
 
     if (msg.type === 'snapshot') {
-      if (typeof msg.difficulty === 'string') {
-        updateDifficultyUI(msg.difficulty as Difficulty);
+      if (isDifficulty(msg.difficulty)) {
+        updateDifficultyUI(msg.difficulty);
       }
       // Update players
-      const snapshotPlayers = (msg.players ?? []) as Player[];
-      document.getElementById('players-online')!.textContent = snapshotPlayers.length.toString();
+      const snapshotPlayers: Player[] = Array.isArray(msg.players) ? msg.players : [];
+      if (playersOnlineLabel) {
+        playersOnlineLabel.textContent = snapshotPlayers.length.toString();
+      }
       const seenPlayers = new Set<string>();
       for (const p of snapshotPlayers) {
         if (p.id === pid) {
@@ -1900,7 +1973,9 @@ function connect() {
 
       // Update health bar
       const healthPercent = (p.hp / p.maxHp) * 100;
-      document.getElementById('health-fill')!.style.width = `${healthPercent}%`;
+      if (healthFillBar) {
+        healthFillBar.style.width = `${healthPercent}%`;
+      }
         } else {
           // Update other players with interpolation
           if (!players.has(p.id)) {
@@ -1917,10 +1992,12 @@ function connect() {
               lastUpdate: nowMs()
             });
           } else {
-            const state = entityStates.get(p.id)!;
-            state.current = { ...state.target };
-            state.target = { x: p.x, y: p.y, z: p.z };
-             state.lastUpdate = nowMs();
+            const state = entityStates.get(p.id);
+            if (state) {
+              state.current = { ...state.target };
+              state.target = { x: p.x, y: p.y, z: p.z };
+              state.lastUpdate = nowMs();
+            }
           }
         }
       }
@@ -1936,7 +2013,7 @@ function connect() {
       }
 
       // Update mobs
-      const snapshotMobs = (msg.mobs ?? []) as Mob[];
+      const snapshotMobs: Mob[] = Array.isArray(msg.mobs) ? msg.mobs : [];
       const seenMobs = new Set<string>();
       for (const m of snapshotMobs) {
         seenMobs.add(m.id);
@@ -1958,18 +2035,19 @@ function connect() {
             lastUpdate: nowMs()
           });
         } else {
-          const state = entityStates.get(m.id)!;
-          state.current = { ...state.target };
-          state.target = { x: m.x, y: mobY, z: m.z };
-           state.lastUpdate = nowMs();
+          const state = entityStates.get(m.id);
+          if (state) {
+            state.current = { ...state.target };
+            state.target = { x: m.x, y: mobY, z: m.z };
+            state.lastUpdate = nowMs();
+          }
         }
 
         // Scale based on health
         const mobMesh = mobs.get(m.id);
         if (mobMesh) {
-          const baseScale = (mobMesh.userData.baseScale as number) ?? 1;
-          const healthScale = baseScale * (0.85 + (m.hp / m.maxHp) * 0.3);
-          mobMesh.scale.setScalar(healthScale);
+          const baseScale = (mobMesh.userData.baseScale as number | undefined) ?? ENEMY_TYPES[m.type].scale;
+          mobMesh.scale.setScalar(baseScale);
         }
       }
 
@@ -1984,7 +2062,7 @@ function connect() {
       }
 
       // Update loot
-      const snapshotLoot = (msg.loot ?? []) as LootDrop[];
+      const snapshotLoot: LootDrop[] = Array.isArray(msg.loot) ? msg.loot : [];
       const seenLoot = new Set<string>();
       for (const l of snapshotLoot) {
         seenLoot.add(l.id);
@@ -1994,10 +2072,12 @@ function connect() {
           scene.add(lootModel);
           lootDrops.set(l.id, lootModel);
         }
-        const mesh = lootDrops.get(l.id)!;
-         mesh.userData.baseY = l.y;
-         mesh.position.set(l.x, l.y, l.z);
-         mesh.rotation.y = 0;
+        const mesh = lootDrops.get(l.id);
+        if (mesh) {
+          mesh.userData.baseY = l.y;
+          mesh.position.set(l.x, l.y, l.z);
+          mesh.rotation.y = 0;
+        }
       }
 
       // Remove picked up loot
@@ -2011,22 +2091,25 @@ function connect() {
     }
 
     if (msg.type === 'event') {
-      if (msg.event === 'difficulty' && typeof msg.difficulty === 'string') {
-        updateDifficultyUI(msg.difficulty as Difficulty);
+      if (msg.event === 'difficulty' && isDifficulty(msg.difficulty)) {
+        updateDifficultyUI(msg.difficulty);
         trackEvent('difficulty_updated', { level: msg.difficulty });
       }
 
       if (msg.event === 'kill') {
-        trackEvent('kill', { playerId: msg.playerId, mobId: msg.mobId, isLocal: msg.playerId === pid });
-        if (msg.playerId === pid) {
+        const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
+        trackEvent('kill', { playerId, mobId: msg.mobId, isLocal: playerId === pid });
+        if (playerId === pid) {
           kills++;
-          document.getElementById('kills')!.textContent = kills.toString();
+          if (killsLabel) {
+            killsLabel.textContent = kills.toString();
+          }
           audioManager.play('enemy_death');
         }
       }
 
-      if (msg.event === 'pickup') {
-        trackEvent('loot_pickup', { playerId: msg.playerId, rarity: msg.item?.rarity });
+      if (msg.event === 'pickup' && isGun(msg.item)) {
+        trackEvent('loot_pickup', { playerId: msg.playerId, rarity: msg.item.rarity });
         if (msg.playerId === pid) {
           inventory.push(msg.item);
           updateInventoryUI();
@@ -2039,7 +2122,13 @@ function connect() {
 
       // REPOMARK:SCOPE: 5.1 - Use muzzle-based origin for local player shots; otherwise use server origin.
       if (msg.event === 'shot') {
-        const isLocalShot = msg.playerId === pid;
+        if (!Array.isArray(msg.origin) || msg.origin.length < 3 || !Array.isArray(msg.direction) || msg.direction.length < 3) {
+          console.warn('Ignoring malformed shot event', msg);
+          return;
+        }
+
+        const shooterId = typeof msg.playerId === 'string' ? msg.playerId : undefined;
+        const isLocalShot = shooterId === pid;
         const startVec =
           isLocalShot
             ? getMuzzleWorldPosition()
@@ -2059,9 +2148,10 @@ function connect() {
                              weaponType === 'shotgun' ? 'shotgun_fire' : 'pistol_fire';
             audioManager.play(soundName);
           }
-        } else {
+        } else if (shooterId) {
           // Other player shooting - use 3D positional audio
-          const weaponType = (players.get(msg.playerId) as any)?.equipped?.archetype || 'pistol';
+          const remotePlayer = players.get(shooterId);
+          const weaponType = remotePlayer?.equipped?.archetype ?? 'pistol';
           const soundName = weaponType === 'smg' ? 'smg_fire' :
                            weaponType === 'rifle' ? 'rifle_fire' :
                            weaponType === 'shotgun' ? 'shotgun_fire' : 'pistol_fire';
@@ -2082,7 +2172,7 @@ function connect() {
         }
       }
 
-      if (msg.event === 'damage' && msg.targetId === pid) {
+      if (msg.event === 'damage' && typeof msg.targetId === 'string' && msg.targetId === pid) {
         if (isSpectator) {
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
@@ -2102,8 +2192,8 @@ function connect() {
           trackEvent('damage_taken', { amount: msg.damage, sourceId: msg.sourceId });
 
           const attackerObj = mobs.get(msg.sourceId) ?? players.get(msg.sourceId);
-          if (attackerObj && (attackerObj as THREE.Object3D).isObject3D) {
-            (attackerObj as THREE.Object3D).getWorldPosition(damageIndicatorScratch.source);
+          if (attackerObj?.isObject3D) {
+            attackerObj.getWorldPosition(damageIndicatorScratch.source);
             showDamageIndicator(damageIndicatorScratch.source);
           }
 
@@ -2161,7 +2251,7 @@ function connect() {
         // handled by snapshot/loot map in next tick; keep as-is
       }
 
-      if (msg.event === 'playerDeath' && msg.playerId === pid) {
+      if (msg.event === 'playerDeath' && typeof msg.playerId === 'string' && msg.playerId === pid) {
         lives = msg.lives ?? Math.max(0, lives - 1);
         updateSpectatorUI();
         // Play death sound
@@ -2188,8 +2278,7 @@ function connect() {
         }
       }
 
-      if (msg.event === 'equip' && msg.item) {
-        trackEvent('weapon_equip', { playerId: msg.playerId, rarity: msg.item.rarity, archetype: msg.item.archetype });
+      if (msg.event === 'equip' && isGun(msg.item)) {
         trackEvent('weapon_equip', { playerId: msg.playerId, rarity: msg.item.rarity, archetype: msg.item.archetype });
         if (msg.playerId === pid) {
           myPlayer = myPlayer ? { ...myPlayer, equipped: msg.item } : myPlayer;
@@ -2198,23 +2287,23 @@ function connect() {
 
           // Play equip sound
           audioManager.play('menu_click');
-        } else {
+        } else if (typeof msg.playerId === 'string') {
           // Update other player's equipped weapon
           const otherPlayer = players.get(msg.playerId);
           if (otherPlayer) {
-            (otherPlayer as any).equipped = msg.item;
+            otherPlayer.equipped = msg.item;
           }
         }
       }
 
-      if (msg.event === 'spectator' && msg.playerId === pid) {
+      if (msg.event === 'spectator' && typeof msg.playerId === 'string' && msg.playerId === pid) {
         isSpectator = true;
         spectatorUntil = msg.until ?? (Date.now() + 45000);
         firing = false;
         updateSpectatorUI();
       }
 
-      if (msg.event === 'playerRespawn' && msg.playerId === pid) {
+      if (msg.event === 'playerRespawn' && typeof msg.playerId === 'string' && msg.playerId === pid) {
         lives = msg.lives ?? lives;
         isSpectator = false;
         spectatorUntil = 0;
@@ -2257,7 +2346,11 @@ function connect() {
   };
 
   ws.onclose = () => {
-    setTimeout(connect, 1000);
+    ws = null;
+    if (reconnectTimeout !== null) {
+      window.clearTimeout(reconnectTimeout);
+    }
+    reconnectTimeout = window.setTimeout(connect, 1000);
   };
 
   ws.onerror = (err) => {
@@ -2344,10 +2437,27 @@ document.addEventListener('contextmenu', (e) => {
 
 // Keyboard input
 document.addEventListener('keydown', (e) => {
+  if (e.code === 'Enter' && e.altKey) {
+    e.preventDefault();
+    toggleFullscreen();
+    return;
+  }
+
   // Escape to unlock pointer
   if (e.code === 'Escape' && isPointerLocked) {
     document.exitPointerLock();
     return;
+  }
+
+  if (e.code === 'F1' || e.code === 'F2' || e.code === 'F3') {
+    e.preventDefault();
+    let level: Difficulty = 'normal';
+    if (e.code === 'F1') level = 'easy';
+    else if (e.code === 'F2') level = 'normal';
+    else if (e.code === 'F3') level = 'hard';
+
+    trackEvent('difficulty_selected', { level });
+    sendDifficulty(level);
   }
 
   keys.add(e.code);
@@ -2411,7 +2521,7 @@ document.addEventListener('keyup', (e) => {
 
 // Check collision with obstacles
 // Improved collision with sliding response
-function resolveCollision(currentPos: THREE.Vector3, desiredPos: THREE.Vector3, radius = 0.5): THREE.Vector3 {
+function resolveCollision(currentPos: THREE.Vector3, desiredPos: THREE.Vector3, radius = WORLD_SCALE.PLAYER_WIDTH * 0.5 + PHYSICS_TUNING.COLLISION_TOLERANCE): THREE.Vector3 {
   const result = desiredPos.clone();
   const STEP_HEIGHT = 0.6;
 
@@ -2547,13 +2657,13 @@ function updateLocalPhysics() {
   velocity.z += az * dt;
 
   if (onGround && inputRight === 0 && inputForward === 0 && !isSliding) {
-    velocity.x *= 1 / (1 + MOVE.friction * dt);
-    velocity.z *= 1 / (1 + MOVE.friction * dt);
+    velocity.x *= 1 / (1 + MOVE.decel * dt);
+    velocity.z *= 1 / (1 + MOVE.decel * dt);
   }
 
   if (isSliding) {
-    velocity.x *= 1 / (1 + MOVE.friction * 0.2 * dt);
-    velocity.z *= 1 / (1 + MOVE.friction * 0.2 * dt);
+    velocity.x *= 1 / (1 + MOVE.decel * 0.2 * dt);
+    velocity.z *= 1 / (1 + MOVE.decel * 0.2 * dt);
   }
 
   localPosition.x += reconcileError.x * RECONCILE.posGain * dt;
@@ -2640,7 +2750,9 @@ function updateLocalPhysics() {
 
 // Send input to server
 function sendInput() {
-  if (!ws || ws.readyState !== 1) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
 
   const moveRight = isSpectator ? 0 : (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
   const moveJump = isSpectator ? 0 : (keys.has('Space') ? 1 : 0);
@@ -2676,12 +2788,18 @@ function sendInput() {
   ws.send(JSON.stringify(inputData));
 }
 
-setInterval(sendInput, 50);
+if (sendInputIntervalId !== null) {
+  window.clearInterval(sendInputIntervalId);
+}
+sendInputIntervalId = window.setInterval(sendInput, 50);
 
 // Update inventory UI
 function updateInventoryUI() {
-  const container = document.getElementById('inventory')!;
-  container.innerHTML = '';
+  if (!inventoryPanelRoot) {
+    return;
+  }
+
+  inventoryPanelRoot.innerHTML = '';
 
   for (let i = 0; i < 5; i++) {
     const slot = document.createElement('div');
@@ -2699,7 +2817,7 @@ function updateInventoryUI() {
       `;
     }
 
-    container.appendChild(slot);
+    inventoryPanelRoot.appendChild(slot);
   }
 }
 
@@ -2756,9 +2874,8 @@ function updateSpectatorUI() {
     crosshair.style.opacity = isSpectator ? '0' : '1';
   }
 
-  const inventoryPanel = document.getElementById('inventory');
-  if (inventoryPanel) {
-    inventoryPanel.style.opacity = isSpectator ? '0.4' : '1';
+  if (inventoryPanelRoot) {
+    inventoryPanelRoot.style.opacity = isSpectator ? '0.4' : '1';
   }
 }
 
@@ -2822,6 +2939,8 @@ function animate() {
   lastFrameTime = now;
 
   updateDayNight(frameTime);
+  terrainProbe.set(localPosition.x, localPosition.y, localPosition.z);
+  updateTerrainAround(terrainProbe);
 
   // Adaptive perf sampling
   perfFrameCount++;
@@ -2877,15 +2996,52 @@ function animate() {
     }
     const mobMesh = mobs.get(id);
     if (mobMesh) {
-      const type = (mobMesh.userData.mobType as string | undefined) ?? 'default';
-      const baseScale = (mobMesh.userData.baseScale as number | undefined) ?? (MOB_BASE_SCALE[type] ?? MOB_BASE_SCALE.default);
+      const type = (mobMesh.userData.mobType as EnemyTypeId | undefined) ?? 'grunt';
+      const baseScale = (mobMesh.userData.baseScale as number | undefined) ?? ENEMY_TYPES[type].scale;
+      const enemyConfig = ENEMY_TYPES[type];
       const phase = (mobMesh.userData.animPhase as number | undefined) ?? 0;
-      const bobStrength = type === 'tank' ? 0.08 : type === 'sniper' ? 0.06 : 0.12;
-      const bob = Math.sin((now + phase) * 0.0025) * bobStrength * (baseScale / 2);
+      const behaviorBob = enemyConfig.behavior === 'defensive' ? 0.06 : enemyConfig.behavior === 'sniper' ? 0.05 : 0.09;
+      const bob = Math.sin((now + phase) * 0.0025) * behaviorBob * enemyConfig.height * 0.15;
       mobMesh.position.set(x, y + bob, z);
 
-      const spinRate = type === 'tank' ? 0.001 : type === 'sniper' ? 0.0015 : type === 'swarm' ? 0.0035 : 0.0025;
+      const spinRate = enemyConfig.behavior === 'defensive' ? 0.0008 : enemyConfig.behavior === 'sniper' ? 0.0012 : 0.002;
       mobMesh.rotation.y += spinRate;
+
+      const telegraph = mobMesh.getObjectByName('mobTelegraph') as THREE.Mesh | undefined;
+      if (telegraph && telegraph.material instanceof THREE.MeshBasicMaterial) {
+        const pulse = 0.26 + Math.sin((now + phase) * 0.004) * 0.1;
+        telegraph.material.opacity = Math.max(0.12, Math.min(0.5, pulse));
+        telegraph.scale.setScalar(enemyConfig.width * 1.8);
+    
+        if (!telegraph.userData.particles) {
+          const jetGeom = new THREE.BufferGeometry();
+          const positions = new Float32Array(180);
+          for (let i = 0; i < positions.length; i += 3) {
+            const angle = (i / positions.length) * Math.PI * 2;
+            const radius = 0.55 + Math.random() * 0.15;
+            positions[i] = Math.cos(angle) * radius;
+            positions[i + 1] = 0;
+            positions[i + 2] = Math.sin(angle) * radius;
+          }
+          jetGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+          const jetMat = new THREE.PointsMaterial({
+            color: glowColors[type] ?? glowColors.default,
+            size: 0.08,
+            transparent: true,
+            opacity: 0.45,
+            depthWrite: false
+          });
+          const ringFx = new THREE.Points(jetGeom, jetMat);
+          ringFx.name = 'telegraphFX';
+          telegraph.add(ringFx);
+          telegraph.userData.particles = ringFx;
+        }
+        const fx = telegraph.userData.particles as THREE.Points;
+        if (fx && fx.material instanceof THREE.PointsMaterial) {
+          fx.rotateY(0.01);
+          fx.material.opacity = telegraph.material.opacity * 0.85;
+        }
+      }
     }
   }
 
@@ -3114,7 +3270,7 @@ function createBulletVisual(start: THREE.Vector3, direction: THREE.Vector3, hit:
   tracer.lookAt(end);
   tracer.rotateX(Math.PI / 2);
   scene.add(tracer);
-  activeTracers.push({ mesh: tracer, start: performance.now(), lifetime: 400 });
+  activeTracers.push({ mesh: tracer, start: performance.now(), lifetime: PHYSICS_TUNING.PROJECTILE_LIFETIME * 1000 });
 
   // Glowing line overlay
   const lineGeometry = new THREE.BufferGeometry().setFromPoints([start, end]);
@@ -3140,7 +3296,7 @@ function createBulletVisual(start: THREE.Vector3, direction: THREE.Vector3, hit:
     projectile,
     trail: [] as THREE.Line[],
     startTime: Date.now(),
-    duration: 120,
+    duration: PHYSICS_TUNING.PROJECTILE_LIFETIME * 1000,
     startPos: start.clone(),
     endPos: end.clone(),
     lastTrailTime: Date.now()
@@ -3198,6 +3354,17 @@ const startBackgroundMusic = () => {
 document.addEventListener('click', startBackgroundMusic, { once: true });
 document.addEventListener('keydown', startBackgroundMusic, { once: true });
 
+window.addEventListener('beforeunload', () => {
+  if (sendInputIntervalId !== null) {
+    window.clearInterval(sendInputIntervalId);
+    sendInputIntervalId = null;
+  }
+  if (reconnectTimeout !== null) {
+    window.clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+});
+
 // Preload voxel models for enemies before starting game
 preloadEnemyModels().then(() => {
   console.log('Voxel enemy models preloaded');
@@ -3211,4 +3378,64 @@ preloadEnemyModels().then(() => {
   // Start game anyway with procedural geometry
   connect();
   animate();
+});
+
+// Cross-browser fullscreen helpers
+function getFullscreenElement(): Element | null {
+  const d = document as any;
+  return document.fullscreenElement || d.webkitFullscreenElement || d.mozFullScreenElement || d.msFullscreenElement || null;
+}
+
+async function requestAppFullscreen(target?: HTMLElement) {
+  const el = target ?? document.documentElement;
+  const anyEl = el as any;
+  try {
+    if (el.requestFullscreen) {
+      await el.requestFullscreen();
+    } else if (anyEl.webkitRequestFullscreen) {
+      await anyEl.webkitRequestFullscreen();
+    } else if (anyEl.mozRequestFullScreen) {
+      await anyEl.mozRequestFullScreen();
+    } else if (anyEl.msRequestFullscreen) {
+      await anyEl.msRequestFullscreen();
+    }
+  } catch (_err) {
+    // ignore failures; browser may block without user gesture
+  }
+}
+
+async function exitAppFullscreen() {
+  const d = document as any;
+  try {
+    if (document.exitFullscreen) {
+      await document.exitFullscreen();
+    } else if (d.webkitExitFullscreen) {
+      await d.webkitExitFullscreen();
+    } else if (d.mozCancelFullScreen) {
+      await d.mozCancelFullScreen();
+    } else if (d.msExitFullscreen) {
+      await d.msExitFullscreen();
+    }
+  } catch (_err) {
+    // ignore
+  }
+}
+
+async function toggleFullscreen() {
+  if (getFullscreenElement()) {
+    trackEvent('fullscreen_exit');
+    await exitAppFullscreen();
+  } else {
+    trackEvent('fullscreen_enter');
+    // Fullscreen the entire game page (canvas + HUD) so the browser UI is hidden.
+    await requestAppFullscreen(document.documentElement);
+  }
+}
+
+// Keep renderer sized correctly when entering/exiting fullscreen (cross-vendor events)
+['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach((evt) => {
+  (document as any).addEventListener(evt, () => {
+    // Recompute sizes immediately (in addition to window 'resize')
+    resize();
+  });
 });

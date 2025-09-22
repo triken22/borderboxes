@@ -3,6 +3,14 @@ import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { ColladaLoader } from 'three/examples/jsm/loaders/ColladaLoader.js';
 import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 
+function materialHasTexture(material: THREE.Material): material is THREE.Material & { map: THREE.Texture | null } {
+  return typeof (material as { map?: unknown }).map !== 'undefined';
+}
+
+function materialSupportsFlatShading(material: THREE.Material): material is THREE.Material & { flatShading: boolean } {
+  return typeof (material as { flatShading?: unknown }).flatShading === 'boolean';
+}
+
 export class VoxelModelLoader {
   private static instance: VoxelModelLoader;
   private modelCache: Map<string, THREE.Group> = new Map();
@@ -75,7 +83,7 @@ export class VoxelModelLoader {
         .then(() => {
           this.mtlLoader.load(
             mtlPath,
-            (materials: any) => {
+            (materials: MTLLoader.MaterialCreator) => {
               materials.preload();
               this.objLoader.setMaterials(materials);
               this.loadOBJWithLoader(path, scale, resolve, reject);
@@ -94,10 +102,10 @@ export class VoxelModelLoader {
     });
   }
 
-  private loadOBJWithLoader(path: string, scale: number, resolve: (value: THREE.Group) => void, reject: (reason?: any) => void) {
+  private loadOBJWithLoader(path: string, scale: number, resolve: (value: THREE.Group) => void, reject: (reason?: unknown) => void) {
     this.objLoader.load(
       path,
-      (object: any) => {
+      (object: THREE.Group) => {
         const group = new THREE.Group();
         group.add(object);
         group.scale.setScalar(scale);
@@ -109,9 +117,9 @@ export class VoxelModelLoader {
     );
   }
 
-  private loadOBJWithTexture(path: string, texturePath: string, scale: number, resolve: (value: THREE.Group) => void, reject: (reason?: any) => void) {
+  private loadOBJWithTexture(path: string, texturePath: string, scale: number, resolve: (value: THREE.Group) => void, reject: (reason?: unknown) => void) {
     // Reset materials
-    this.objLoader.setMaterials(null as any);
+    this.objLoader.setMaterials(new MTLLoader.MaterialCreator(''));
 
     // Try loading texture
     const textureLoader = new THREE.TextureLoader();
@@ -123,12 +131,11 @@ export class VoxelModelLoader {
 
         this.objLoader.load(
           path,
-          (object: any) => {
+          (object: THREE.Group) => {
             const group = new THREE.Group();
-            object.traverse((child: any) => {
-              if ((child as THREE.Mesh).isMesh) {
-                const mesh = child as THREE.Mesh;
-                mesh.material = new THREE.MeshPhongMaterial({
+            object.traverse((child: THREE.Object3D) => {
+              if (child instanceof THREE.Mesh) {
+                child.material = new THREE.MeshPhongMaterial({
                   map: texture,
                   flatShading: true
                 });
@@ -151,10 +158,10 @@ export class VoxelModelLoader {
     );
   }
 
-  private loadOBJBasic(path: string, scale: number, resolve: (value: THREE.Group) => void, reject: (reason?: any) => void) {
+  private loadOBJBasic(path: string, scale: number, resolve: (value: THREE.Group) => void, reject: (reason?: unknown) => void) {
     this.objLoader.load(
       path,
-      (object: any) => {
+      (object: THREE.Group) => {
         const group = new THREE.Group();
         group.add(object);
         group.scale.setScalar(scale);
@@ -170,7 +177,7 @@ export class VoxelModelLoader {
     return new Promise((resolve, reject) => {
       this.colladaLoader.load(
         path,
-        (collada: any) => {
+        (collada: ColladaLoader.Collada) => {
           const group = new THREE.Group();
           group.add(collada.scene);
           group.scale.setScalar(scale);
@@ -237,8 +244,8 @@ export class VoxelModelLoader {
 
   private applyVoxelShading(group: THREE.Group) {
     group.traverse((child) => {
-      if ((child as THREE.Mesh).isMesh) {
-        const mesh = child as THREE.Mesh;
+      if (child instanceof THREE.Mesh) {
+        const mesh = child;
 
         // Validate geometry exists and has valid data
         if (mesh.geometry && mesh.geometry.attributes.position) {
@@ -270,14 +277,13 @@ export class VoxelModelLoader {
   }
 
   private configureVoxelMaterial(material: THREE.Material) {
-    if ((material as any).map) {
-      const map = (material as any).map as THREE.Texture;
-      map.magFilter = THREE.NearestFilter;
-      map.minFilter = THREE.NearestFilter;
+    if (materialHasTexture(material) && material.map) {
+      material.map.magFilter = THREE.NearestFilter;
+      material.map.minFilter = THREE.NearestFilter;
     }
 
-    if ((material as THREE.MeshPhongMaterial).flatShading !== undefined) {
-      (material as THREE.MeshPhongMaterial).flatShading = true;
+    if (materialSupportsFlatShading(material)) {
+      material.flatShading = true;
     }
 
     material.needsUpdate = true;

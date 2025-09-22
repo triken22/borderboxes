@@ -1,6 +1,7 @@
 import { Env } from './index';
 import { rollGun, Gun } from './loot';
 import { createTerrainHeightMap } from './terrain';
+import { ENEMY_TYPES, EnemyTypeId, WORLD_SCALE } from '../../shared/gameConfig';
 
 const MOVE = {
   maxSpeed: 6,
@@ -36,31 +37,31 @@ const DIFFICULTY_CONFIG: Record<Difficulty, {
   damageMultiplier: number;
   speedMultiplier: number;
   rangeMultiplier: number;
-  mobTypes: Mob['type'][];
+  mobTypes: EnemyTypeId[];
 }> = {
   easy: {
-    maxMobs: 2,
-    spawnInterval: 180,
-    damageMultiplier: 0.15,
-    speedMultiplier: 0.5,
-    rangeMultiplier: 0.4,
-    mobTypes: ['charger', 'swarm']
+    maxMobs: 3,
+    spawnInterval: 220,
+    damageMultiplier: 0.45,
+    speedMultiplier: 0.75,
+    rangeMultiplier: 0.6,
+    mobTypes: ['grunt', 'sniper']
   },
   normal: {
-    maxMobs: 10,
-    spawnInterval: 100,
-    damageMultiplier: 1,
-    speedMultiplier: 1,
-    rangeMultiplier: 1,
-    mobTypes: ['shooter', 'charger', 'jumper', 'sniper', 'tank', 'swarm']
+    maxMobs: 8,
+    spawnInterval: 150,
+    damageMultiplier: 0.85,
+    speedMultiplier: 0.9,
+    rangeMultiplier: 0.9,
+    mobTypes: ['grunt', 'sniper', 'heavy']
   },
   hard: {
-    maxMobs: 14,
-    spawnInterval: 80,
-    damageMultiplier: 1.5,
-    speedMultiplier: 1.1,
-    rangeMultiplier: 1.2,
-    mobTypes: ['shooter', 'charger', 'jumper', 'sniper', 'tank', 'swarm']
+    maxMobs: 12,
+    spawnInterval: 110,
+    damageMultiplier: 1.15,
+    speedMultiplier: 1.05,
+    rangeMultiplier: 1.1,
+    mobTypes: ['grunt', 'sniper', 'heavy']
   }
 };
 
@@ -71,7 +72,7 @@ export class Room {
   private players = new Map<string, Player>();
   private mobs = new Map<string, Mob>();
   private loot = new Map<string, LootDrop>();
-  private tickTimer: any | null = null;
+  private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickMs: number;
   private tickCounter = 0;
   private roomSeed: string;
@@ -117,14 +118,14 @@ export class Room {
     });
   }
 
-  private handleDifficulty(_playerId: string, level: any) {
+  private handleDifficulty(_playerId: string, level: unknown) {
     if (typeof level !== 'string') return;
     if (level === 'easy' || level === 'normal' || level === 'hard') {
       this.setDifficulty(level);
     }
   }
 
-  private async handleAnalytics(data: any) {
+  private async handleAnalytics(data: unknown) {
     try {
       // Forward analytics to the main worker for storage
       // (D1 is not directly accessible from Durable Objects)
@@ -143,13 +144,15 @@ export class Room {
     }
   }
 
-  private handleDamageAck(playerId: string, msg: any) {
+  private handleDamageAck(playerId: string, msg: unknown) {
     if (!msg || typeof msg !== 'object') return;
     const player = this.players.get(playerId);
     if (!player) return;
-    if (!msg.ignored) return;
 
-    if (msg.reason === 'spectator') {
+    const payload = msg as { ignored?: unknown; reason?: unknown };
+    if (!payload.ignored) return;
+
+    if (payload.reason === 'spectator') {
       player.lastSpectatorAck = Date.now();
     }
   }
@@ -297,7 +300,8 @@ export class Room {
     // Handle messages
     ws.addEventListener("message", (ev: MessageEvent) => {
       try {
-        const msg = JSON.parse(ev.data as string);
+        const raw = typeof ev.data === 'string' ? ev.data : String(ev.data ?? '');
+        const msg = JSON.parse(raw);
         if (msg.type === "input") this.applyInput(playerId, msg);
         else if (msg.type === "pickup") this.handlePickup(playerId, msg.lootId);
         else if (msg.type === "equip") this.handleEquip(playerId, msg.itemId);
@@ -327,50 +331,55 @@ export class Room {
     if (!this.tickTimer) this.startTick();
   }
 
-  private applyInput(id: string, msg: any) {
-    const p = this.players.get(id);
-    if (!p) return;
+  private applyInput(id: string, msg: unknown) {
+    const player = this.players.get(id);
+    if (!player || !msg || typeof msg !== 'object') return;
 
-    const move = Array.isArray(msg.move) ? msg.move : [0, 0, 0];
-    const rawRight = typeof move[0] === 'number' ? move[0] : 0;
-    const rawJump = typeof move[1] === 'number' ? move[1] : 0;
-    const rawBack = typeof move[2] === 'number' ? move[2] : 0;
+    const payload = msg as {
+      move?: unknown;
+      aim?: unknown;
+      firing?: unknown;
+      ads?: unknown;
+      t?: unknown;
+    };
 
-    p.inputRight = Math.max(-1, Math.min(1, rawRight));
-    p.inputForward = Math.max(-1, Math.min(1, -rawBack));
+    const moveArray = Array.isArray(payload.move) ? payload.move : [];
+    const rawRight = typeof moveArray[0] === 'number' ? moveArray[0] : 0;
+    const rawJump = typeof moveArray[1] === 'number' ? moveArray[1] : 0;
+    const rawBack = typeof moveArray[2] === 'number' ? moveArray[2] : 0;
 
-    if (p.isSpectator) {
-      if (msg.aim) {
-        p.aimX = msg.aim[0];
-        p.aimY = msg.aim[1];
-        p.aimZ = msg.aim[2];
+    player.inputRight = Math.max(-1, Math.min(1, rawRight));
+    player.inputForward = Math.max(-1, Math.min(1, -rawBack));
+
+    const aimArray = Array.isArray(payload.aim) ? payload.aim : null;
+    if (player.isSpectator) {
+      if (aimArray && aimArray.length >= 3) {
+        player.aimX = typeof aimArray[0] === 'number' ? aimArray[0] : player.aimX;
+        player.aimY = typeof aimArray[1] === 'number' ? aimArray[1] : player.aimY;
+        player.aimZ = typeof aimArray[2] === 'number' ? aimArray[2] : player.aimZ;
       }
       return;
     }
 
     const jumpPressed = rawJump > 0.5;
-    if (jumpPressed && !p.jumpHeld) {
-      p.jumpQueued = true;
-      p.jumpRequestedAt = Date.now();
+    if (jumpPressed && !player.jumpHeld) {
+      player.jumpQueued = true;
+      player.jumpRequestedAt = Date.now();
     }
-    if (!jumpPressed) {
-      p.jumpHeld = false;
-    } else {
-      p.jumpHeld = true;
+    player.jumpHeld = jumpPressed;
+
+    if (aimArray && aimArray.length >= 3) {
+      player.aimX = typeof aimArray[0] === 'number' ? aimArray[0] : player.aimX;
+      player.aimY = typeof aimArray[1] === 'number' ? aimArray[1] : player.aimY;
+      player.aimZ = typeof aimArray[2] === 'number' ? aimArray[2] : player.aimZ;
     }
 
-    if (msg.aim) {
-      p.aimX = msg.aim[0];
-      p.aimY = msg.aim[1];
-      p.aimZ = msg.aim[2];
+    if (typeof payload.ads === 'boolean') {
+      player.ads = payload.ads;
     }
 
-    if (typeof msg.ads === 'boolean') {
-      p.ads = !!msg.ads;
-    }
-
-    p.firing = !!msg.firing;
-    p.t = msg.t || Date.now();
+    player.firing = !!payload.firing;
+    player.t = typeof payload.t === 'number' ? payload.t : Date.now();
   }
 
   private handlePickup(playerId: string, lootId: string) {
@@ -425,51 +434,40 @@ export class Room {
     const difficultyConfig = this.getDifficultyConfig();
     if (this.mobs.size >= difficultyConfig.maxMobs) return;
 
-    const id = `mob_${this.tickCounter}_${Math.random().toString(36).substring(7)}`;
-    let angle = Math.random() * Math.PI * 2;
-    let dist = 20 + Math.random() * 20;
-    
-    // Weighted random mob type selection
-    const availableTypes = difficultyConfig.mobTypes.length > 0
-      ? difficultyConfig.mobTypes
-      : ['shooter', 'charger', 'jumper', 'sniper', 'tank', 'swarm'];
+    const allowedTypes = difficultyConfig.mobTypes.length > 0 ? difficultyConfig.mobTypes : (['grunt', 'sniper', 'heavy'] as const);
+    if (allowedTypes.length === 0) return;
 
-    // Weighted random mob type selection
-    const baseTypes: Array<Mob['type']> = ['shooter', 'charger', 'jumper', 'sniper', 'tank', 'swarm'];
-    const weights = [30, 25, 20, 10, 5, 10]; // Spawn weights
+    const weightByType: Record<EnemyTypeId, number> = {
+      grunt: 60,
+      sniper: 25,
+      heavy: 15
+    };
 
-    const filteredEntries = baseTypes
-      .map((type, idx) => ({ type, weight: weights[idx] }))
-      .filter(entry => availableTypes.includes(entry.type));
-
-    const totalWeight = filteredEntries.reduce((sum, entry) => sum + entry.weight, 0) || 1;
+    const weightedPool = allowedTypes.map(type => ({ type, weight: weightByType[type] ?? 1 }));
+    const totalWeight = weightedPool.reduce((sum, entry) => sum + entry.weight, 0) || 1;
     let random = Math.random() * totalWeight;
-    let type: Mob['type'] = filteredEntries[0]?.type ?? 'charger';
+    let type: EnemyTypeId = weightedPool[0]?.type ?? 'grunt';
 
-    for (const entry of filteredEntries) {
+    for (const entry of weightedPool) {
       random -= entry.weight;
       if (random <= 0) {
         type = entry.type;
         break;
       }
     }
-    
-    let hp = 30;
-    let maxHp = 30;
-    
-    switch(type) {
-      case 'tank': hp = maxHp = 150; break;
-      case 'charger': hp = maxHp = 50; break;
-      case 'jumper': hp = maxHp = 40; break;
-      case 'sniper': hp = maxHp = 25; break;
-      case 'swarm': hp = maxHp = 15; break;
-      case 'shooter': hp = maxHp = 30; break;
-    }
 
+    const baseHp: Record<EnemyTypeId, number> = {
+      grunt: 55,
+      sniper: 35,
+      heavy: 140
+    };
+
+    const id = `mob_${this.tickCounter}_${Math.random().toString(36).substring(7)}`;
+    let angle = Math.random() * Math.PI * 2;
+    let dist = 20 + Math.random() * 20;
     let spawnX = 32 + Math.cos(angle) * dist;
     let spawnZ = 32 + Math.sin(angle) * dist;
 
-    // Keep mobs from spawning right on top of players
     for (let attempt = 0; attempt < 4; attempt++) {
       let tooClose = false;
       for (const player of this.players.values()) {
@@ -488,6 +486,8 @@ export class Room {
     }
 
     const spawnY = this.getTerrainHeight(spawnX, spawnZ);
+    const hp = baseHp[type];
+    const maxHp = hp;
 
     this.mobs.set(id, {
       id,
@@ -503,8 +503,7 @@ export class Room {
       target: null,
       lastAttackTime: 0,
       state: 'patrol',
-      patrolTarget: { x: Math.random() * 64, z: Math.random() * 64 },
-      jumpCooldown: 0
+      patrolTarget: { x: Math.random() * 64, z: Math.random() * 64 }
     });
   }
 
@@ -514,7 +513,11 @@ export class Room {
     const speedScale = config.speedMultiplier;
 
     for (const mob of this.mobs.values()) {
-      // Find nearest player
+      const enemyConfig = ENEMY_TYPES[mob.type];
+      if (!enemyConfig) {
+        continue;
+      }
+
       let nearestPlayer: Player | null = null;
       let nearestDist = Infinity;
 
@@ -529,148 +532,89 @@ export class Room {
         }
       }
 
-      mob.target = nearestPlayer?.id || null;
+      mob.target = nearestPlayer?.id ?? null;
 
-      // Update AI state
-      const baseAlert = mob.type === 'sniper' ? 40 : 25;
-      const baseAttack = mob.type === 'sniper' ? 35 : mob.type === 'tank' ? 8 : 15;
+      const baseAlert = enemyConfig.behavior === 'sniper' ? 45 : enemyConfig.behavior === 'defensive' ? 24 : 30;
+      const baseAttack = enemyConfig.behavior === 'sniper' ? 40 : enemyConfig.behavior === 'defensive' ? 10 : 6;
       const alertRange = baseAlert * config.rangeMultiplier;
       const attackRange = baseAttack * config.rangeMultiplier;
-      
-    if (nearestPlayer && nearestDist < alertRange) {
+
+      if (nearestPlayer && nearestDist < alertRange) {
         mob.state = nearestDist < attackRange ? 'attack' : 'alert';
-        
+
         const dx = nearestPlayer.x - mob.x;
         const dz = nearestPlayer.z - mob.z;
-        const dist = Math.sqrt(dx * dx + dz * dz);
+        const dist = Math.max(0.001, Math.sqrt(dx * dx + dz * dz));
 
-        // Type-specific behavior
         switch (mob.type) {
-          case 'charger':
-            // Rush towards player with heavier mass
-            const chargeSpeed = 0.12 * speedScale;
-            mob.vx = (dx / dist) * chargeSpeed;
-            mob.vz = (dz / dist) * chargeSpeed;
-            if (dist < 3.2 && now - mob.lastAttackTime > 650) {
-              if (this.applyDamage(nearestPlayer, 18, mob.id)) {
+          case 'grunt': {
+            const chaseSpeed = 0.09 * speedScale;
+            mob.vx = (dx / dist) * chaseSpeed;
+            mob.vz = (dz / dist) * chaseSpeed;
+            mob.vx += -(dz / dist) * 0.015 * speedScale;
+            mob.vz += (dx / dist) * 0.015 * speedScale;
+
+            if (dist < 2.6 && now - mob.lastAttackTime > 900) {
+              if (this.applyDamage(nearestPlayer, 16, mob.id)) {
                 mob.lastAttackTime = now;
               }
             }
             break;
-            
-          case 'jumper':
-            // Jump attack
-            const groundHere = this.getTerrainHeight(mob.x, mob.z);
-            const onGround = Math.abs(mob.y - groundHere) < 0.05;
-            mob.jumpCooldown = (mob.jumpCooldown ?? 0) - dt;
-            if (mob.jumpCooldown <= 0 && dist < 16 && onGround) {
-              mob.vx = (dx / dist) * 0.26 * speedScale;
-              mob.vy = 0.6;
-              mob.vz = (dz / dist) * 0.26 * speedScale;
-              mob.jumpCooldown = 2.25;
-            }
-            if (dist < 3.4 && now - mob.lastAttackTime > 1050) {
-              if (this.applyDamage(nearestPlayer, 22, mob.id)) {
-                mob.lastAttackTime = now;
-              }
-            }
-            break;
-            
-          case 'sniper':
-            // Keep distance with larger footprint
-            if (dist < 30) {
-              mob.vx = -(dx / dist) * 0.045 * speedScale;
-              mob.vz = -(dz / dist) * 0.045 * speedScale;
-            } else if (dist > 40) {
-              mob.vx = (dx / dist) * 0.028 * speedScale;
-              mob.vz = (dz / dist) * 0.028 * speedScale;
+          }
+          case 'sniper': {
+            const retreatDist = 32;
+            const reengageDist = 44;
+            if (dist < retreatDist) {
+              mob.vx = -(dx / dist) * 0.04 * speedScale;
+              mob.vz = -(dz / dist) * 0.04 * speedScale;
+            } else if (dist > reengageDist) {
+              mob.vx = (dx / dist) * 0.026 * speedScale;
+              mob.vz = (dz / dist) * 0.026 * speedScale;
             } else {
               mob.vx = 0;
               mob.vz = 0;
             }
-            if (dist < 48 && now - mob.lastAttackTime > 3200) {
-              if (this.applyDamage(nearestPlayer, 38, mob.id)) {
+
+            if (dist < reengageDist && now - mob.lastAttackTime > 3200) {
+              if (this.applyDamage(nearestPlayer, 34, mob.id)) {
                 mob.lastAttackTime = now;
               }
             }
             break;
-            
-          case 'tank':
-            // Slow approach with heavy tread
-            mob.vx = (dx / dist) * 0.038 * speedScale;
-            mob.vz = (dz / dist) * 0.038 * speedScale;
-            if (dist < 5.5 && now - mob.lastAttackTime > 2100) {
-              // Area damage with larger blast
+          }
+          case 'heavy': {
+            const lumberSpeed = 0.035 * speedScale;
+            mob.vx = (dx / dist) * lumberSpeed;
+            mob.vz = (dz / dist) * lumberSpeed;
+
+            if (dist < 6 && now - mob.lastAttackTime > 2200) {
               for (const player of this.players.values()) {
                 const pdx = player.x - mob.x;
                 const pdz = player.z - mob.z;
                 const pdist = Math.sqrt(pdx * pdx + pdz * pdz);
-                if (pdist < 9) {
-                  const damage = Math.max(1, Math.floor(28 - pdist * 2.6));
-                  this.applyDamage(player, damage, mob.id, { ignoreLineOfSight: true });
+                if (pdist < 8.5) {
+                  const falloff = Math.max(2, Math.floor(26 - pdist * 2.2));
+                  this.applyDamage(player, falloff, mob.id, { ignoreLineOfSight: true });
                 }
               }
               mob.lastAttackTime = now;
             }
             break;
-            
-          case 'swarm':
-            // Fast swarming
-            mob.vx = (dx / dist) * 0.1 * speedScale;
-            mob.vz = (dz / dist) * 0.1 * speedScale;
-            // Flocking behavior
-            for (const other of this.mobs.values()) {
-              if (other.id !== mob.id && other.type === 'swarm') {
-                const sdx = other.x - mob.x;
-                const sdz = other.z - mob.z;
-                const sdist = Math.sqrt(sdx * sdx + sdz * sdz);
-                if (sdist < 3) {
-                  mob.vx -= (sdx / sdist) * 0.05 * speedScale;
-                  mob.vz -= (sdz / sdist) * 0.05 * speedScale;
-                } else if (sdist < 10) {
-                  mob.vx += (sdx / sdist) * 0.02 * speedScale;
-                  mob.vz += (sdz / sdist) * 0.02 * speedScale;
-                }
-              }
-            }
-            if (dist < 2.6 && now - mob.lastAttackTime > 550) {
-              if (this.applyDamage(nearestPlayer, 6, mob.id)) {
-                mob.lastAttackTime = now;
-              }
-            }
-            break;
-            
-          case 'shooter':
-          default:
-            // Keep distance and shoot
-            const idealDist = 18;
-            if (dist > idealDist) {
-              mob.vx = (dx / dist) * 0.09 * speedScale;
-              mob.vz = (dz / dist) * 0.09 * speedScale;
-            } else if (dist < idealDist - 6) {
-              mob.vx = -(dx / dist) * 0.09 * speedScale;
-              mob.vz = -(dz / dist) * 0.09 * speedScale;
-            }
-            if (dist < 26 && now - mob.lastAttackTime > 900) {
-              if (this.applyDamage(nearestPlayer, 12, mob.id)) {
-                mob.lastAttackTime = now;
-              }
-            }
-            break;
+          }
         }
       } else {
-        // Patrol behavior
         mob.state = 'patrol';
         if (mob.patrolTarget) {
           const dx = mob.patrolTarget.x - mob.x;
           const dz = mob.patrolTarget.z - mob.z;
           const dist = Math.sqrt(dx * dx + dz * dz);
-          
+
           if (dist < 2) {
-            mob.patrolTarget = { x: Math.random() * 64, z: Math.random() * 64 };
+            mob.patrolTarget = { x: Math.random() * WORLD_SIZE, z: Math.random() * WORLD_SIZE };
           } else {
-            mob.vx = (dx / dist) * 0.05 * speedScale;
-            mob.vz = (dz / dist) * 0.05 * speedScale;
+            const patrolSpeed = 0.05 * speedScale;
+            mob.vx = (dx / dist) * patrolSpeed;
+            mob.vz = (dz / dist) * patrolSpeed;
           }
         } else if (Math.random() < 0.02) {
           mob.vx = (Math.random() - 0.5) * 0.05 * speedScale;
@@ -678,23 +622,19 @@ export class Room {
         }
       }
 
-      // Apply physics at a nominal 60Hz base
       const stepScale = Math.max(0.001, dt / FIXED_TICK);
       const GRAVITY = 0.03;
       const TERMINAL_VEL = 2.0;
-      
-      // Apply gravity
+
       mob.vy -= GRAVITY * stepScale;
       if (mob.vy < -TERMINAL_VEL) {
         mob.vy = -TERMINAL_VEL;
       }
-      
-      // Integrate positions
+
       mob.x += mob.vx * stepScale;
       mob.y += mob.vy * stepScale;
       mob.z += mob.vz * stepScale;
-      
-      // Ground collision using terrain
+
       const ground = this.getTerrainHeight(mob.x, mob.z);
       if (mob.y <= ground) {
         mob.y = ground;
@@ -702,24 +642,22 @@ export class Room {
           mob.vy = 0;
         }
       }
-      
-      // Apply friction / drag
-      const onGround = Math.abs(mob.y - ground) < 0.05;
-      if (onGround) {
-        mob.vx *= Math.pow(0.9, stepScale);
-        mob.vz *= Math.pow(0.9, stepScale);
-      } else {
-        mob.vx *= Math.pow(0.98, stepScale);
-        mob.vz *= Math.pow(0.98, stepScale);
-      }
 
-      // Keep mobs from occupying the exact player position
+      const onGround = Math.abs(mob.y - ground) < 0.05;
+      const damp = onGround ? 0.9 : 0.98;
+      mob.vx *= Math.pow(damp, stepScale);
+      mob.vz *= Math.pow(damp, stepScale);
+
+      mob.x = Math.max(0, Math.min(WORLD_SIZE, mob.x));
+      mob.z = Math.max(0, Math.min(WORLD_SIZE, mob.z));
+
       for (const player of this.players.values()) {
         const dx = mob.x - player.x;
         const dz = mob.z - player.z;
         const horizontalDist = Math.sqrt(dx * dx + dz * dz);
-        if (horizontalDist < 1.8) {
-          const pushDist = 1.8 - horizontalDist;
+        const minSeparation = enemyConfig.width + WORLD_SCALE.PLAYER_WIDTH;
+        if (horizontalDist < minSeparation) {
+          const pushDist = minSeparation - horizontalDist;
           const inv = horizontalDist > 0.001 ? 1 / horizontalDist : 0;
           const offsetX = (horizontalDist > 0.001 ? dx * inv : (Math.random() - 0.5)) * pushDist;
           const offsetZ = (horizontalDist > 0.001 ? dz * inv : (Math.random() - 0.5)) * pushDist;
@@ -729,9 +667,7 @@ export class Room {
         }
       }
 
-      // Remove dead mobs
       if (mob.hp <= 0) {
-        // Drop loot chance
         if (Math.random() < 0.3) {
           const lootId = `loot_${Date.now()}_${Math.random().toString(36).substring(7)}`;
           const gun = rollGun(`${this.roomSeed}_${lootId}`);
@@ -1067,15 +1003,7 @@ export class Room {
 
       const rayDist = Math.hypot(mob.x - closestPointX, mob.y - closestPointY, mob.z - closestPointZ);
 
-      let hitboxRadius = 0.8;
-      switch (mob.type) {
-        case 'tank': hitboxRadius = 1.2; break;
-        case 'charger': hitboxRadius = 0.9; break;
-        case 'jumper': hitboxRadius = 0.8; break;
-        case 'swarm': hitboxRadius = 0.6; break;
-        case 'sniper': hitboxRadius = 0.7; break;
-        case 'shooter': hitboxRadius = 0.8; break;
-      }
+      const hitboxRadius = ENEMY_TYPES[mob.type]?.hitRadius ?? WORLD_SCALE.MOB_WIDTH;
 
       if (rayDist <= hitboxRadius) {
         if (!closestHit || distance < closestHit.distance) {
@@ -1111,7 +1039,7 @@ export class Room {
       const offY = targetCenterY - closestY;
       const offZ = targetCenterZ - closestZ;
       const rayDistance = Math.sqrt(offX * offX + offY * offY + offZ * offZ);
-      const hitboxRadius = 0.6;
+      const hitboxRadius = WORLD_SCALE.PLAYER_WIDTH * 0.9;
       if (rayDistance <= hitboxRadius) {
         if (!closestPlayerHit || distance < closestPlayerHit.distance) {
           closestPlayerHit = {
@@ -1182,17 +1110,7 @@ export class Room {
     } else if (closestHit) {
       const { mob, distance, rayOff } = closestHit;
       const falloff = Math.max(0.5, 1 - (distance / player.equipped.range) * 0.5);
-      const baseRadius = (() => {
-        switch (mob.type) {
-          case 'tank': return 1.2;
-          case 'charger': return 0.9;
-          case 'jumper': return 0.8;
-          case 'swarm': return 0.6;
-          case 'sniper': return 0.7;
-          case 'shooter': return 0.8;
-          default: return 0.8;
-        }
-      })();
+      const baseRadius = ENEMY_TYPES[mob.type]?.hitRadius ?? WORLD_SCALE.MOB_WIDTH;
       const isCrit = computeCrit(distance, rayOff, baseRadius);
       const critMul = isCrit ? 2.0 : 1.0;
       const damage = Math.floor(basePerShot * falloff * critMul * (0.9 + Math.random() * 0.2));
@@ -1300,11 +1218,18 @@ export class Room {
     this.broadcast(snapshot);
   }
 
-  private broadcast(message: any) {
-    const str = JSON.stringify(message);
+  private broadcast(message: unknown) {
+    let payload: string;
+    try {
+      payload = JSON.stringify(message);
+    } catch (error) {
+      console.error('Failed to serialize broadcast message', error, message);
+      return;
+    }
+
     for (const socket of this.sockets.values()) {
       try {
-        socket.send(str);
+        socket.send(payload);
       } catch (e) {
         console.error("Error broadcasting:", e);
       }
@@ -1345,11 +1270,12 @@ type Player = {
   invulnerableUntil?: number;
   ads?: boolean;             // NEW: aim-down-sights state
   lastDamageAt?: number;     // NEW: short hit cooldown timestamp
+  lastSpectatorAck?: number;
 };
 
 type Mob = {
   id: string;
-  type: 'charger' | 'shooter' | 'jumper' | 'sniper' | 'tank' | 'swarm';
+  type: EnemyTypeId;
   x: number;
   y: number;
   z: number;
@@ -1362,7 +1288,6 @@ type Mob = {
   lastAttackTime: number;
   state?: 'idle' | 'patrol' | 'alert' | 'attack' | 'retreat';
   patrolTarget?: { x: number; z: number };
-  jumpCooldown?: number;
 };
 
 type LootDrop = {
