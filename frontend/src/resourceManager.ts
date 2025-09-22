@@ -18,9 +18,17 @@ class ResourceManager {
     return geometry;
   }
 
+  untrackGeometry(geometry: THREE.BufferGeometry): void {
+    this.geometries.delete(geometry);
+  }
+
   trackMaterial<T extends THREE.Material>(material: T): T {
     this.materials.add(material);
     return material;
+  }
+
+  untrackMaterial(material: THREE.Material): void {
+    this.materials.delete(material);
   }
 
   trackTexture<T extends THREE.Texture>(texture: T): T {
@@ -28,9 +36,17 @@ class ResourceManager {
     return texture;
   }
 
+  untrackTexture(texture: THREE.Texture): void {
+    this.textures.delete(texture);
+  }
+
   trackRenderTarget<T extends THREE.WebGLRenderTarget>(target: T): T {
     this.renderTargets.add(target);
     return target;
+  }
+
+  untrackRenderTarget(target: THREE.WebGLRenderTarget): void {
+    this.renderTargets.delete(target);
   }
 
   dispose(): void {
@@ -39,7 +55,10 @@ class ResourceManager {
     }
     for (const material of this.materials) {
       if ('map' in material && material.map) {
-        material.map.dispose();
+        const map = material.map;
+        if (map instanceof THREE.Texture) {
+          map.dispose();
+        }
       }
       material.dispose();
     }
@@ -47,7 +66,9 @@ class ResourceManager {
       texture.dispose();
     }
     for (const target of this.renderTargets) {
-      target.dispose();
+      if (typeof target.dispose === 'function') {
+        target.dispose();
+      }
     }
 
     this.clear();

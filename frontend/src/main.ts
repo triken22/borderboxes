@@ -240,6 +240,18 @@ function isGun(value: unknown): value is Gun {
   );
 }
 
+function toNumber(value: unknown, fallback = 0): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function toStringOrUndefined(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function isVector3Tuple(value: unknown): value is [number, number, number] {
+  return Array.isArray(value) && value.length >= 3 && value.every(component => typeof component === 'number' && Number.isFinite(component));
+}
+
 function sendDifficulty(level: Difficulty) {
   if (level === currentDifficulty) return;
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -334,6 +346,13 @@ function getMuzzleWorldPosition(): THREE.Vector3 {
 // Time helper for consistent animation timing
 const nowMs = () => performance.now();
 
+const ENEMY_GLOW_COLORS: Record<EnemyTypeId | 'default', number> = {
+  grunt: 0xf26d4c,
+  sniper: 0xe2a9ff,
+  heavy: 0xffd166,
+  default: 0xffffff
+};
+
 // Movement and reconciliation constants
 const MOVE = {
   maxSpeed: PHYSICS_TUNING.PLAYER_MAX_SPEED,
@@ -375,30 +394,200 @@ const reconcileError = new THREE.Vector3(0, 0, 0);
 
 // Import world helpers
 
-// --- New: tracer pool (thin cylinders with additive blend) ---
-const tracerPool: THREE.Mesh[] = [];
-const activeTracers: Array<{ mesh: THREE.Mesh; start: number; lifetime: number }> = [];
-
-function allocTracer(): THREE.Mesh {
-  const m = tracerPool.pop();
-  if (m) { m.visible = true; return m; }
-  const geom = new THREE.CylinderGeometry(0.06, 0.06, 1, 6, 1, false); // Solid cylinder, wider
-  const mat = new THREE.MeshBasicMaterial({
-    color: 0xffff00,
-    transparent: true,
-    opacity: 1,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-    side: THREE.DoubleSide
-  });
-  const mesh = new THREE.Mesh(geom, mat);
-  mesh.frustumCulled = false;
-  return mesh;
+// Object pooling helpers
+interface BulletVisual {
+  projectile: THREE.Mesh;
+  tracer: THREE.Mesh;
+  line: THREE.Line;
+  trail: THREE.Line[];
+  startPos: THREE.Vector3;
+  endPos: THREE.Vector3;
 }
 
+const activeTracers: Array<{ mesh: THREE.Mesh; start: number; lifetime: number }> = [];
+
+const tracerGeometry = resourceManager.trackGeometry(new THREE.CylinderGeometry(0.06, 0.06, 1, 6, 1, false));
+const tracerMaterialTemplate = resourceManager.trackMaterial(new THREE.MeshBasicMaterial({
+  color: 0xffff00,
+  transparent: true,
+  opacity: 1,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+  side: THREE.DoubleSide
+}));
+
+const tracerPool = new ObjectPool<THREE.Mesh>(
+  () => {
+    const material = tracerMaterialTemplate.clone();
+    resourceManager.trackMaterial(material);
+    const mesh = new THREE.Mesh(tracerGeometry, material);
+    mesh.visible = false;
+    mesh.frustumCulled = false;
+    return mesh;
+  },
+  (mesh) => {
+    mesh.visible = false;
+    mesh.scale.set(1, 1, 1);
+    mesh.rotation.set(0, 0, 0);
+    if (mesh.parent) mesh.parent.remove(mesh);
+  },
+  32
+);
+
+const projectileGeometry = resourceManager.trackGeometry(new THREE.SphereGeometry(0.12, 8, 6));
+const projectileMaterialTemplate = resourceManager.trackMaterial(new THREE.MeshBasicMaterial({
+  color: 0xffff00,
+  transparent: true,
+  opacity: 1
+}));
+
+const lineMaterialTemplate = resourceManager.trackMaterial(new THREE.LineBasicMaterial({
+  color: 0xffaa00,
+  transparent: true,
+  opacity: 0.8,
+  linewidth: 2
+}));
+
+function createLine(): THREE.Line {
+  const geometry = resourceManager.trackGeometry(new THREE.BufferGeometry());
+  const positions = new Float32Array(6);
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = lineMaterialTemplate.clone();
+  resourceManager.trackMaterial(material);
+  const line = new THREE.Line(geometry, material);
+  line.frustumCulled = false;
+  const payload = line.userData as Record<string, unknown>;
+  payload.positions = positions;
+  payload.start = new THREE.Vector3();
+  payload.end = new THREE.Vector3();
+  return line;
+}
+
+function updateLine(line: THREE.Line, start: THREE.Vector3, end: THREE.Vector3) {
+  const payload = line.userData as Record<string, unknown>;
+  const positions = (payload.positions as Float32Array | undefined) ?? null;
+  if (!positions) return;
+  positions[0] = start.x;
+  positions[1] = start.y;
+  positions[2] = start.z;
+  positions[3] = end.x;
+  positions[4] = end.y;
+  positions[5] = end.z;
+  (line.geometry as THREE.BufferGeometry).attributes.position.needsUpdate = true;
+  const startVec = (payload.start as THREE.Vector3 | undefined) ?? null;
+  const endVec = (payload.end as THREE.Vector3 | undefined) ?? null;
+  if (startVec) {
+    startVec.copy(start);
+  } else {
+    payload.start = start.clone();
+  }
+  if (endVec) {
+    endVec.copy(end);
+  } else {
+    payload.end = end.clone();
+  }
+}
+
+const trailSegmentPool = new ObjectPool<THREE.Line>(
+  () => {
+    const segment = createLine();
+    segment.visible = false;
+    return segment;
+  },
+  (segment) => {
+    segment.visible = false;
+    segment.rotation.set(0, 0, 0);
+    if (segment.parent) segment.parent.remove(segment);
+  },
+  32
+);
+
+const bulletPool = new ObjectPool<BulletVisual>(
+  () => {
+    const projectileMaterial = projectileMaterialTemplate.clone();
+    resourceManager.trackMaterial(projectileMaterial);
+    const projectile = new THREE.Mesh(projectileGeometry, projectileMaterial);
+    projectile.visible = false;
+
+    const tracer = tracerPool.acquire();
+    tracer.visible = false;
+
+    const line = createLine();
+    line.visible = false;
+
+    return {
+      projectile,
+      tracer,
+      line,
+      trail: [],
+      startPos: new THREE.Vector3(),
+      endPos: new THREE.Vector3()
+    };
+  },
+  (visual) => {
+    visual.trail.forEach(segment => {
+      trailSegmentPool.release(segment);
+    });
+    visual.trail.length = 0;
+    visual.startPos.set(0, 0, 0);
+    visual.endPos.set(0, 0, 0);
+    if (visual.projectile.parent) visual.projectile.parent.remove(visual.projectile);
+    if (visual.line.parent) visual.line.parent.remove(visual.line);
+    visual.projectile.visible = false;
+    visual.line.visible = false;
+    const tracerIdx = activeTracers.findIndex(entry => entry.mesh === visual.tracer);
+    if (tracerIdx !== -1) {
+      activeTracers.splice(tracerIdx, 1);
+    }
+    tracerPool.release(visual.tracer);
+  },
+  32
+);
+
+const muzzleFlashTextures = [
+  resourceManager.trackTexture(new THREE.CanvasTexture(createFlashTexture())),
+  resourceManager.trackTexture(new THREE.CanvasTexture(createFlashTexture())),
+  resourceManager.trackTexture(new THREE.CanvasTexture(createFlashTexture()))
+];
+
+const muzzleSpritePool = new ObjectPool<THREE.Sprite>(
+  () => {
+    const material = resourceManager.trackMaterial(new THREE.SpriteMaterial({
+      transparent: true,
+      opacity: 1,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    }));
+    const sprite = new THREE.Sprite(material);
+    sprite.visible = false;
+    return sprite;
+  },
+  (sprite) => {
+    sprite.visible = false;
+    sprite.scale.set(1, 1, 1);
+    const material = sprite.material as THREE.SpriteMaterial;
+    material.opacity = 1;
+    material.color.setHex(0xffffff);
+    if (sprite.parent) sprite.parent.remove(sprite);
+  },
+  24
+);
+
+const muzzleLightPool = new ObjectPool<THREE.PointLight>(
+  () => {
+    const light = new THREE.PointLight(0xffaa00, 2, 6, 2);
+    light.visible = false;
+    return light;
+  },
+  (light) => {
+    light.visible = false;
+    if (light.parent) light.parent.remove(light);
+  },
+  8
+);
+
 function freeTracer(mesh: THREE.Mesh) {
-  mesh.visible = false;
-  tracerPool.push(mesh);
+  tracerPool.release(mesh);
 }
 
 // --- New: adaptive performance controls (pixel ratio + postFX) ---
@@ -943,13 +1132,6 @@ async function preloadEnemyModels() {
 // Apply shared styling cues (glow hull + telegraph) so every enemy feels cohesive.
 function applyMobPostProcess(group: THREE.Group, type: EnemyTypeId | 'default') {
   const tempVec = new THREE.Vector3();
-  const glowColors: Record<EnemyTypeId | 'default', number> = {
-    grunt: 0xf26d4c,
-    sniper: 0xe2a9ff,
-    heavy: 0xffd166,
-    default: 0xffffff
-  };
-
   let primaryMesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material | THREE.Material[]> | null = null;
   let largestExtent = 0;
 
@@ -1007,7 +1189,7 @@ function applyMobPostProcess(group: THREE.Group, type: EnemyTypeId | 'default') 
   const sourceGeometry = (targetMesh.geometry as THREE.BufferGeometry).clone();
 
   const glowMaterial = new THREE.MeshBasicMaterial({
-    color: glowColors[type] ?? glowColors.default,
+    color: ENEMY_GLOW_COLORS[type] ?? ENEMY_GLOW_COLORS.default,
     transparent: true,
     opacity: 0.14,
     side: THREE.BackSide,
@@ -1034,7 +1216,7 @@ function applyMobPostProcess(group: THREE.Group, type: EnemyTypeId | 'default') 
   const telegraphRing = new THREE.Mesh(
     new THREE.RingGeometry(0.5, 0.7, 40),
     new THREE.MeshBasicMaterial({
-      color: glowColors[type] ?? glowColors.default,
+      color: ENEMY_GLOW_COLORS[type] ?? ENEMY_GLOW_COLORS.default,
       transparent: true,
       opacity: 0.32,
       side: THREE.DoubleSide,
@@ -1414,6 +1596,13 @@ function disposeObject(obj: THREE.Object3D) {
   });
 }
 
+function releaseEnemyMesh(mesh: THREE.Object3D) {
+  disposeObject(mesh);
+  if (mesh.parent) {
+    mesh.parent.remove(mesh);
+  }
+}
+
 function createMobModel(type: EnemyTypeId): THREE.Object3D {
   const key: EnemyTypeId = mobPrototypeFactories[type] ? type : 'grunt';
   let prototype = mobPrototypes.get(key);
@@ -1561,68 +1750,169 @@ const lootDrops = new Map<string, THREE.Object3D>();
 // Audio system is now handled by AudioManager with Howler.js
 
 // Bullet trails and effects
-interface Bullet {
-  projectile: THREE.Mesh;
-  trail: THREE.Line[];
+interface BulletInstance {
+  visual: BulletVisual;
   startTime: number;
   duration: number;
-  startPos: THREE.Vector3;
-  endPos: THREE.Vector3;
   lastTrailTime: number;
 }
 
-const activeBullets: Bullet[] = [];
-const hitMarkers: Array<{mesh: THREE.Sprite, startTime: number}> = [];
-const muzzleFlashes: Array<{mesh: THREE.Sprite, startTime: number}> = [];
-const impactParticles: Array<{system: THREE.Points, startTime: number, velocities: Float32Array}> = [];
+const activeBullets: BulletInstance[] = [];
+const hitMarkers: Array<{ mesh: THREE.Sprite; startTime: number }> = [];
+
+interface MuzzleFlashInstance {
+  sprite: THREE.Sprite;
+  startTime: number;
+  baseScale: number;
+  layer: number;
+}
+
+const muzzleFlashes: MuzzleFlashInstance[] = [];
+const activeMuzzleLights: Array<{ light: THREE.PointLight; startTime: number; duration: number; baseIntensity: number }> = [];
+
+interface ImpactParticleInstance {
+  system: THREE.Points;
+  velocities: Float32Array;
+  startTime: number;
+  lastUpdate: number;
+}
+
+const impactParticlePool = new ObjectPool<ImpactParticleInstance>(
+  () => {
+    const count = 25;
+    const geometry = resourceManager.trackGeometry(new THREE.BufferGeometry());
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    const sizes = new Float32Array(count);
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+    const material = new THREE.PointsMaterial({
+      size: 0.3,
+      vertexColors: true,
+      transparent: true,
+      opacity: 1,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      sizeAttenuation: true
+    });
+    resourceManager.trackMaterial(material);
+
+    const system = new THREE.Points(geometry, material);
+    system.visible = false;
+
+    return {
+      system,
+      velocities: new Float32Array(count * 3),
+      startTime: 0,
+      lastUpdate: 0
+    };
+  },
+  (particle) => {
+    particle.system.visible = false;
+    if (particle.system.parent) particle.system.parent.remove(particle.system);
+    particle.startTime = 0;
+    particle.lastUpdate = 0;
+  },
+  12
+);
+
+interface SplatterInstance {
+  mesh: THREE.Mesh<THREE.CircleGeometry, THREE.MeshBasicMaterial>;
+}
+
+const splatterPool = new ObjectPool<SplatterInstance>(
+  () => {
+    const geometry = resourceManager.trackGeometry(new THREE.CircleGeometry(0.5, 16));
+    const material = resourceManager.trackMaterial(new THREE.MeshBasicMaterial({
+      color: 0x660000,
+      transparent: true,
+      opacity: 0.7,
+      side: THREE.DoubleSide
+    }));
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.visible = false;
+    mesh.rotation.x = -Math.PI / 2;
+    return { mesh };
+  },
+  (instance) => {
+    const { mesh } = instance;
+    mesh.visible = false;
+    mesh.scale.set(1, 1, 1);
+    mesh.rotation.z = 0;
+    const material = mesh.material as THREE.MeshBasicMaterial;
+    material.opacity = 0.7;
+    if (mesh.parent) mesh.parent.remove(mesh);
+  },
+  16
+);
+
+const impactParticles: ImpactParticleInstance[] = [];
+const activeSplatters: Array<{ instance: SplatterInstance; startTime: number; lifetime: number }> = [];
+
+const bulletPositionScratch = new THREE.Vector3();
+const bulletMidScratch = new THREE.Vector3();
+const tracerDirScratch = new THREE.Vector3();
+const audioForwardScratch = new THREE.Vector3();
 
 // Create muzzle flash effect
 function createMuzzleFlash(origin: number[]) {
-  // Create multiple flash sprites for layered effect
   const flashCount = 3;
-  
-  for (let i = 0; i < flashCount; i++) {
-    const texture = new THREE.CanvasTexture(createFlashTexture());
-    
-    const colors = [0xffffff, 0xffaa00, 0xff6600];
-    const scales = [1.2, 0.8, 0.5];
-    const opacities = [0.9, 0.7, 1.0];
-    
-    const material = new THREE.SpriteMaterial({
-      map: texture,
-      color: colors[i],
-      transparent: true,
-      opacity: opacities[i],
-      blending: THREE.AdditiveBlending,
-      depthWrite: false
-    });
+  const colors = [0xffffff, 0xffaa00, 0xff6600];
+  const scales = [1.2, 0.85, 0.5];
+  const opacities = [0.9, 0.7, 1.0];
+  const now = nowMs();
 
-    const sprite = new THREE.Sprite(material);
+  for (let i = 0; i < flashCount; i++) {
+    const sprite = muzzleSpritePool.acquire();
+    const material = sprite.material as THREE.SpriteMaterial;
+    const texture = muzzleFlashTextures[Math.min(i, muzzleFlashTextures.length - 1)];
+    material.map = texture;
+    material.needsUpdate = true;
+    material.opacity = opacities[i];
+    material.color.setHex(colors[i]);
+
     sprite.position.set(
       origin[0] + (Math.random() - 0.5) * 0.1,
       origin[1] + (Math.random() - 0.5) * 0.1,
       origin[2] + (Math.random() - 0.5) * 0.1
     );
-    sprite.scale.set(scales[i], scales[i], 1);
+    const scale = scales[i];
+    sprite.scale.set(scale, scale, 1);
     sprite.rotation.z = Math.random() * Math.PI;
-    scene.add(sprite);
+    sprite.visible = true;
+
+    if (!sprite.parent) {
+      scene.add(sprite);
+    }
 
     muzzleFlashes.push({
-      mesh: sprite,
-      startTime: nowMs()
+      sprite,
+      startTime: now,
+      baseScale: scale,
+      layer: i
     });
   }
-  
-  // Add point light for flash illumination
-  const flashLight = new THREE.PointLight(0xffaa00, 2, 5);
-  flashLight.position.set(origin[0], origin[1], origin[2]);
-  scene.add(flashLight);
-  
-  // Fade out the light
-  setTimeout(() => {
-    scene.remove(flashLight);
-    flashLight.dispose();
-  }, 50);
+
+  const light = muzzleLightPool.acquire();
+  light.color.setHex(0xffaa00);
+  light.position.set(origin[0], origin[1], origin[2]);
+  light.intensity = 2;
+  light.distance = 6;
+  light.decay = 2;
+  (light.userData as { baseIntensity?: number }).baseIntensity = light.intensity;
+  light.visible = true;
+  if (!light.parent) {
+    scene.add(light);
+  }
+
+  activeMuzzleLights.push({
+    light,
+    startTime: now,
+    duration: 140,
+    baseIntensity: light.intensity
+  });
 }
 
 // Helper to create muzzle flash texture
@@ -1757,111 +2047,94 @@ function createHitMarker(x: number, y: number, z: number, damage: number, crit: 
 
 // Create impact particle effects
 function createImpactParticles(x: number, y: number, z: number) {
-  const particleCount = 25;
-  const geometry = new THREE.BufferGeometry();
+  const instance = impactParticlePool.acquire();
+  const geometry = instance.system.geometry as THREE.BufferGeometry;
+  const positions = geometry.getAttribute('position') as THREE.BufferAttribute;
+  const colors = geometry.getAttribute('color') as THREE.BufferAttribute;
+  const sizes = geometry.getAttribute('size') as THREE.BufferAttribute;
+  const velocities = instance.velocities;
+  const now = nowMs();
 
-  // Create particle positions
-  const positions = new Float32Array(particleCount * 3);
-  const velocities = new Float32Array(particleCount * 3);
-  const colors = new Float32Array(particleCount * 3);
-  const sizes = new Float32Array(particleCount);
+  for (let i = 0; i < positions.count; i++) {
+    positions.setXYZ(i, x, y, z);
 
-  for (let i = 0; i < particleCount; i++) {
-    // Start at impact position
-    positions[i * 3] = x;
-    positions[i * 3 + 1] = y;
-    positions[i * 3 + 2] = z;
-
-    // Random velocities in a cone shape with more spread
     const speed = 0.2 + Math.random() * 0.5;
     const theta = Math.random() * Math.PI * 2;
-    const phi = Math.random() * Math.PI * 0.7; // Wider spread
+    const phi = Math.random() * Math.PI * 0.7;
 
     velocities[i * 3] = Math.sin(phi) * Math.cos(theta) * speed;
-    velocities[i * 3 + 1] = Math.cos(phi) * speed * 0.5 + 0.2; // More upward bias
+    velocities[i * 3 + 1] = Math.cos(phi) * speed * 0.5 + 0.2;
     velocities[i * 3 + 2] = Math.sin(phi) * Math.sin(theta) * speed;
 
-    // Mix of red/orange/yellow for blood/spark effect
     const colorType = Math.random();
     if (colorType < 0.3) {
-      // Blood red
-      colors[i * 3] = 0.8 + Math.random() * 0.2;
-      colors[i * 3 + 1] = Math.random() * 0.2;
-      colors[i * 3 + 2] = 0;
+      colors.setXYZ(i, 0.8 + Math.random() * 0.2, Math.random() * 0.2, 0);
     } else {
-      // Spark orange/yellow
-      colors[i * 3] = 1;
-      colors[i * 3 + 1] = 0.5 + Math.random() * 0.5;
-      colors[i * 3 + 2] = Math.random() * 0.3;
+      colors.setXYZ(i, 1, 0.5 + Math.random() * 0.5, Math.random() * 0.3);
     }
 
-    // Varied sizes
-    sizes[i] = 0.15 + Math.random() * 0.35;
+    sizes.setX(i, 0.15 + Math.random() * 0.35);
   }
 
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+  positions.needsUpdate = true;
+  colors.needsUpdate = true;
+  sizes.needsUpdate = true;
 
-  // Particle material with additive blending
-  const material = new THREE.PointsMaterial({
-    size: 0.3,
-    vertexColors: true,
-    transparent: true,
-    opacity: 1,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-    sizeAttenuation: true
-  });
+  instance.system.visible = true;
+  instance.startTime = now;
+  instance.lastUpdate = now;
+  if (!instance.system.parent) {
+    scene.add(instance.system);
+  }
+  impactParticles.push(instance);
 
-  const particleSystem = new THREE.Points(geometry, material);
-  scene.add(particleSystem);
+  const splatter = splatterPool.acquire();
+  const mesh = splatter.mesh;
+  mesh.visible = true;
+  mesh.position.set(x, 0.01, z);
+  const scale = 0.3 + Math.random() * 0.35;
+  mesh.scale.setScalar(scale);
+  mesh.rotation.z = Math.random() * Math.PI;
+  const material = mesh.material as THREE.MeshBasicMaterial;
+  material.opacity = 0.7;
+  if (!mesh.parent) {
+    scene.add(mesh);
+  }
+  activeSplatters.push({ instance: splatter, startTime: now, lifetime: 3500 });
 
-  impactParticles.push({
-    system: particleSystem,
-    startTime: Date.now(),
-    velocities: velocities
-  });
-
-  // Create blood splatter on ground
-  const splatterGeometry = new THREE.CircleGeometry(0.3 + Math.random() * 0.3, 8);
-  const splatterMaterial = new THREE.MeshBasicMaterial({
-    color: 0x660000,
-    transparent: true,
-    opacity: 0.7,
-    side: THREE.DoubleSide
-  });
-  const splatter = new THREE.Mesh(splatterGeometry, splatterMaterial);
-  splatter.position.set(x, 0.01, z); // Just above ground
-  splatter.rotation.x = -Math.PI / 2; // Flat on ground
-  scene.add(splatter);
-  
-  // Fade out splatter over time
-  setTimeout(() => {
-    const fadeInterval = setInterval(() => {
-      splatterMaterial.opacity -= 0.02;
-      if (splatterMaterial.opacity <= 0) {
-        clearInterval(fadeInterval);
-        scene.remove(splatter);
-        splatterGeometry.dispose();
-        splatterMaterial.dispose();
-      }
-    }, 100);
-  }, 3000);
-  
-  // Clean up old particles
   while (impactParticles.length > 8) {
     const old = impactParticles.shift();
     if (old) {
-      scene.remove(old.system);
-      old.system.geometry.dispose();
-      (old.system.material as THREE.Material).dispose();
+      releaseImpactParticle(old);
+    }
+  }
+  while (activeSplatters.length > 12) {
+    const old = activeSplatters.shift();
+    if (old) {
+      releaseSplatter(old.instance);
     }
   }
 }
 
+function releaseImpactParticle(particle: ImpactParticleInstance) {
+  if (particle.system.parent) {
+    particle.system.parent.remove(particle.system);
+  }
+  particle.system.visible = false;
+  impactParticlePool.release(particle);
+}
+
+function releaseSplatter(instance: SplatterInstance) {
+  const { mesh } = instance;
+  if (mesh.parent) {
+    mesh.parent.remove(mesh);
+  }
+  mesh.visible = false;
+  splatterPool.release(instance);
+}
+
 // WebSocket connection
-let pid = crypto.randomUUID();
+let pid: string = crypto.randomUUID();
 let myPlayer: Player | null = null;
 let inventory: Gun[] = [];
 let kills = 0;
@@ -2054,8 +2327,7 @@ function connect() {
       // Remove dead mobs
       for (const [id, mesh] of mobs.entries()) {
         if (!seenMobs.has(id)) {
-          disposeObject(mesh);
-          scene.remove(mesh);
+          releaseEnemyMesh(mesh);
           mobs.delete(id);
           entityStates.delete(id);
         }
@@ -2097,8 +2369,9 @@ function connect() {
       }
 
       if (msg.event === 'kill') {
-        const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
-        trackEvent('kill', { playerId, mobId: msg.mobId, isLocal: playerId === pid });
+        const playerId = toStringOrUndefined(msg.playerId) ?? '';
+        const mobId = toStringOrUndefined(msg.mobId);
+        trackEvent('kill', { playerId, mobId, isLocal: playerId === pid });
         if (playerId === pid) {
           kills++;
           if (killsLabel) {
@@ -2109,8 +2382,9 @@ function connect() {
       }
 
       if (msg.event === 'pickup' && isGun(msg.item)) {
-        trackEvent('loot_pickup', { playerId: msg.playerId, rarity: msg.item.rarity });
-        if (msg.playerId === pid) {
+        const playerId = toStringOrUndefined(msg.playerId);
+        trackEvent('loot_pickup', { playerId, rarity: msg.item.rarity });
+        if (playerId === pid) {
           inventory.push(msg.item);
           updateInventoryUI();
           audioManager.play('pickup');
@@ -2122,27 +2396,27 @@ function connect() {
 
       // REPOMARK:SCOPE: 5.1 - Use muzzle-based origin for local player shots; otherwise use server origin.
       if (msg.event === 'shot') {
-        if (!Array.isArray(msg.origin) || msg.origin.length < 3 || !Array.isArray(msg.direction) || msg.direction.length < 3) {
+        if (!isVector3Tuple(msg.origin) || !isVector3Tuple(msg.direction)) {
           console.warn('Ignoring malformed shot event', msg);
           return;
         }
 
-        const shooterId = typeof msg.playerId === 'string' ? msg.playerId : undefined;
+        const shooterId = toStringOrUndefined(msg.playerId);
         const isLocalShot = shooterId === pid;
-        const startVec =
-          isLocalShot
-            ? getMuzzleWorldPosition()
-            : new THREE.Vector3(msg.origin[0], msg.origin[1], msg.origin[2]);
-        const dirVec = new THREE.Vector3(msg.direction[0], msg.direction[1], msg.direction[2]).normalize();
+        const [originX, originY, originZ] = msg.origin;
+        const [dirX, dirY, dirZ] = msg.direction;
+
+        const startVec = isLocalShot ? getMuzzleWorldPosition() : new THREE.Vector3(originX, originY, originZ);
+        const dirVec = new THREE.Vector3(dirX, dirY, dirZ).normalize();
 
         if (!(isSpectator && isLocalShot)) {
-          createBulletVisual(startVec, dirVec, !!msg.hit); // NEW visual with tracer + projectile
+          createBulletVisual(startVec.clone(), dirVec, msg.hit === true);
         }
 
         // Play weapon sound based on the shooting player's equipped weapon
         if (isLocalShot) {
           if (!isSpectator) {
-            const weaponType = myPlayer?.equipped?.archetype || 'pistol';
+            const weaponType = myPlayer?.equipped?.archetype ?? 'pistol';
             const soundName = weaponType === 'smg' ? 'smg_fire' :
                              weaponType === 'rifle' ? 'rifle_fire' :
                              weaponType === 'shotgun' ? 'shotgun_fire' : 'pistol_fire';
@@ -2160,48 +2434,57 @@ function connect() {
       }
 
       if (msg.event === 'hit') {
-        createHitMarker(msg.x, msg.y, msg.z, msg.damage, msg.crit);
-        createImpactParticles(msg.x, msg.y, msg.z);
-        // Hit sound is now handled by audioManager
+        const hitX = toNumber(msg.x);
+        const hitY = toNumber(msg.y);
+        const hitZ = toNumber(msg.z);
+        const damageAmount = toNumber(msg.damage);
+        const isCrit = msg.crit === true;
 
-        // Play appropriate hit sound
-        if (msg.crit) {
-          audioManager.play3D('critical_hit', new THREE.Vector3(msg.x, msg.y, msg.z));
-        } else {
-          audioManager.play3D('hit_marker', new THREE.Vector3(msg.x, msg.y, msg.z));
-        }
+        createHitMarker(hitX, hitY, hitZ, damageAmount, isCrit);
+        createImpactParticles(hitX, hitY, hitZ);
+
+        const impactPosition = new THREE.Vector3(hitX, hitY, hitZ);
+        audioManager.play3D(isCrit ? 'critical_hit' : 'hit_marker', impactPosition);
       }
 
-      if (msg.event === 'damage' && typeof msg.targetId === 'string' && msg.targetId === pid) {
+      if (msg.event === 'damage') {
+        const targetId = toStringOrUndefined(msg.targetId);
+        if (targetId !== pid) {
+          return;
+        }
+
+        const damageAmount = toNumber(msg.damage);
+        const sourceId = toStringOrUndefined(msg.sourceId);
+
         if (isSpectator) {
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               type: 'damageAck',
               ignored: true,
               reason: 'spectator',
-              amount: msg.damage,
-              sourceId: msg.sourceId,
+              amount: damageAmount,
+              sourceId,
               t: nowMs()
             }));
           }
           trackEvent('spectator_damage_ignored', {
-            amount: msg.damage,
-            sourceId: msg.sourceId
+            amount: damageAmount,
+            sourceId
           });
         } else {
-          trackEvent('damage_taken', { amount: msg.damage, sourceId: msg.sourceId });
+          trackEvent('damage_taken', { amount: damageAmount, sourceId });
 
-          const attackerObj = mobs.get(msg.sourceId) ?? players.get(msg.sourceId);
+          const attackerObj = sourceId ? mobs.get(sourceId) ?? players.get(sourceId) : undefined;
           if (attackerObj?.isObject3D) {
             attackerObj.getWorldPosition(damageIndicatorScratch.source);
             showDamageIndicator(damageIndicatorScratch.source);
           }
 
           // Play pain sound based on damage amount
-          audioManager.playPainSound(msg.damage);
+          audioManager.playPainSound(damageAmount);
           lastDamageTime = performance.now();
           // Screen shake effect when player takes damage
-          const shakeIntensity = Math.min(msg.damage * 0.002, 0.1);
+          const shakeIntensity = Math.min(damageAmount * 0.002, 0.1);
           const shakeDuration = 200;
           const shakeStart = performance.now();
           
@@ -2252,7 +2535,8 @@ function connect() {
       }
 
       if (msg.event === 'playerDeath' && typeof msg.playerId === 'string' && msg.playerId === pid) {
-        lives = msg.lives ?? Math.max(0, lives - 1);
+        const livesRemaining = typeof msg.lives === 'number' ? msg.lives : Math.max(0, lives - 1);
+        lives = livesRemaining;
         updateSpectatorUI();
         // Play death sound
         audioManager.playDeathSound();
@@ -2279,17 +2563,18 @@ function connect() {
       }
 
       if (msg.event === 'equip' && isGun(msg.item)) {
-        trackEvent('weapon_equip', { playerId: msg.playerId, rarity: msg.item.rarity, archetype: msg.item.archetype });
-        if (msg.playerId === pid) {
+        const equipPlayerId = toStringOrUndefined(msg.playerId);
+        trackEvent('weapon_equip', { playerId: equipPlayerId, rarity: msg.item.rarity, archetype: msg.item.archetype });
+        if (equipPlayerId === pid) {
           myPlayer = myPlayer ? { ...myPlayer, equipped: msg.item } : myPlayer;
           console.log('Player equipped weapon:', msg.item);
           applyWeaponCosmetics(msg.item);
 
           // Play equip sound
           audioManager.play('menu_click');
-        } else if (typeof msg.playerId === 'string') {
+        } else if (equipPlayerId) {
           // Update other player's equipped weapon
-          const otherPlayer = players.get(msg.playerId);
+          const otherPlayer = players.get(equipPlayerId);
           if (otherPlayer) {
             otherPlayer.equipped = msg.item;
           }
@@ -2298,13 +2583,13 @@ function connect() {
 
       if (msg.event === 'spectator' && typeof msg.playerId === 'string' && msg.playerId === pid) {
         isSpectator = true;
-        spectatorUntil = msg.until ?? (Date.now() + 45000);
+        spectatorUntil = typeof msg.until === 'number' ? msg.until : Date.now() + 45000;
         firing = false;
         updateSpectatorUI();
       }
 
       if (msg.event === 'playerRespawn' && typeof msg.playerId === 'string' && msg.playerId === pid) {
-        lives = msg.lives ?? lives;
+        lives = typeof msg.lives === 'number' ? msg.lives : lives;
         isSpectator = false;
         spectatorUntil = 0;
         updateSpectatorUI();
@@ -2317,13 +2602,16 @@ function connect() {
         }
         
         // Reset position
-        localPosition = { x: msg.x, y: msg.y, z: msg.z };
+        const respawnX = toNumber(msg.x, localPosition.x);
+        const respawnY = toNumber(msg.y, localPosition.y);
+        const respawnZ = toNumber(msg.z, localPosition.z);
+        localPosition = { x: respawnX, y: respawnY, z: respawnZ };
         serverPosition = { ...localPosition };
-        me.position.set(localPosition.x, localPosition.y, localPosition.z);
+        me.position.set(respawnX, respawnY, respawnZ);
         reconcileError.set(0, 0, 0);
         
         // Visual feedback for invulnerability
-        if (msg.invulnerable) {
+        if (msg.invulnerable === true) {
           // Make player semi-transparent during invulnerability
           const originalOpacity = materials.player.opacity;
           materials.player.transparent = true;
@@ -2581,8 +2869,11 @@ function resolveCollision(currentPos: THREE.Vector3, desiredPos: THREE.Vector3, 
 }
 
 // Local physics update
-function updateLocalPhysics() {
-  const dt = 1/60; // Fixed timestep for consistent physics
+function updateLocalPhysics(deltaMs: number) {
+  if (!Number.isFinite(deltaMs) || deltaMs <= 0) {
+    return;
+  }
+  const dt = deltaMs / 1000; // Fixed timestep provided by shared GameLoop
 
   // Calculate movement direction based on camera yaw
   const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
@@ -2929,27 +3220,19 @@ function resize() {
 addEventListener('resize', resize);
 resize();
 
-// Animation loop with fixed timestep
-let lastFrameTime = performance.now();
-let accumulator = 0;
-const FIXED_TIMESTEP = 1000 / 60; // 60 FPS physics
-function animate() {
-  const now = performance.now();
-  const frameTime = Math.min(now - lastFrameTime, 100);
-  lastFrameTime = now;
+let frameNow = performance.now();
 
-  updateDayNight(frameTime);
-  terrainProbe.set(localPosition.x, localPosition.y, localPosition.z);
-  updateTerrainAround(terrainProbe);
+const physicsStep = (deltaMs: number) => {
+  updateLocalPhysics(deltaMs);
+};
 
-  // Adaptive perf sampling
+function updatePerformanceBudget(deltaMs: number) {
   perfFrameCount++;
-  perfAccumMS += frameTime;
+  perfAccumMS += deltaMs;
   if (perfFrameCount >= 60) {
-    const avgMs = perfAccumMS / perfFrameCount; // ~1s window
-    const fps = 1000 / avgMs;
+    const avgMs = perfAccumMS / perfFrameCount;
+    const fps = avgMs > 0 ? 1000 / avgMs : 60;
 
-    // If FPS low, first drop postFX, then reduce resolution; if high, bring back
     if (fps < 50) {
       if (postFxEnabled) {
         togglePostFX(false);
@@ -2969,15 +3252,9 @@ function animate() {
     perfFrameCount = 0;
     perfAccumMS = 0;
   }
+}
 
-  // Fixed timestep physics for local player
-  accumulator += frameTime;
-  while (accumulator >= FIXED_TIMESTEP) {
-    updateLocalPhysics();
-    accumulator -= FIXED_TIMESTEP;
-  }
-
-  // Interpolate other entities smoothly with proper timing
+function updateRemoteEntities(now: number) {
   for (const [id, state] of entityStates.entries()) {
     const timeSinceUpdate = now - state.lastUpdate;
     const t = Math.max(0, Math.min(timeSinceUpdate / INTERP_MS, 1));
@@ -2994,17 +3271,27 @@ function animate() {
         nameLabel.lookAt(camera.position);
       }
     }
+
     const mobMesh = mobs.get(id);
     if (mobMesh) {
       const type = (mobMesh.userData.mobType as EnemyTypeId | undefined) ?? 'grunt';
-      const baseScale = (mobMesh.userData.baseScale as number | undefined) ?? ENEMY_TYPES[type].scale;
       const enemyConfig = ENEMY_TYPES[type];
       const phase = (mobMesh.userData.animPhase as number | undefined) ?? 0;
-      const behaviorBob = enemyConfig.behavior === 'defensive' ? 0.06 : enemyConfig.behavior === 'sniper' ? 0.05 : 0.09;
+      const behaviorBob =
+        enemyConfig.behavior === 'defensive'
+          ? 0.06
+          : enemyConfig.behavior === 'sniper'
+          ? 0.05
+          : 0.09;
       const bob = Math.sin((now + phase) * 0.0025) * behaviorBob * enemyConfig.height * 0.15;
       mobMesh.position.set(x, y + bob, z);
 
-      const spinRate = enemyConfig.behavior === 'defensive' ? 0.0008 : enemyConfig.behavior === 'sniper' ? 0.0012 : 0.002;
+      const spinRate =
+        enemyConfig.behavior === 'defensive'
+          ? 0.0008
+          : enemyConfig.behavior === 'sniper'
+          ? 0.0012
+          : 0.002;
       mobMesh.rotation.y += spinRate;
 
       const telegraph = mobMesh.getObjectByName('mobTelegraph') as THREE.Mesh | undefined;
@@ -3012,7 +3299,7 @@ function animate() {
         const pulse = 0.26 + Math.sin((now + phase) * 0.004) * 0.1;
         telegraph.material.opacity = Math.max(0.12, Math.min(0.5, pulse));
         telegraph.scale.setScalar(enemyConfig.width * 1.8);
-    
+
         if (!telegraph.userData.particles) {
           const jetGeom = new THREE.BufferGeometry();
           const positions = new Float32Array(180);
@@ -3025,7 +3312,7 @@ function animate() {
           }
           jetGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
           const jetMat = new THREE.PointsMaterial({
-            color: glowColors[type] ?? glowColors.default,
+            color: ENEMY_GLOW_COLORS[type] ?? ENEMY_GLOW_COLORS.default,
             size: 0.08,
             transparent: true,
             opacity: 0.45,
@@ -3044,159 +3331,269 @@ function animate() {
       }
     }
   }
+}
 
-  updateCamera();
-  updateUI();
-  updateSpectatorUI();
-
-  // Animate loot drops with smooth bobbing
+function animateLoot(now: number) {
   for (const mesh of lootDrops.values()) {
     const baseY = mesh.userData.baseY ?? mesh.position.y;
     mesh.position.y = baseY + Math.sin(now * 0.003) * 0.2;
     mesh.rotation.y += 0.02;
   }
+}
 
-  // Update bullets & trails (existing)
+function stepBulletInstances(now: number) {
   for (let i = activeBullets.length - 1; i >= 0; i--) {
     const bullet = activeBullets[i];
     const age = now - bullet.startTime;
-
-    if (age > bullet.duration) {
-      scene.remove(bullet.projectile);
-      bullet.projectile.geometry.dispose();
-      (bullet.projectile.material as THREE.Material).dispose();
-
-      bullet.trail.forEach(segment => {
-        scene.remove(segment);
-        segment.geometry.dispose();
-        (segment.material as THREE.Material).dispose();
-      });
-
+    if (age >= bullet.duration) {
+      releaseBullet(bullet);
       activeBullets.splice(i, 1);
-    } else {
-      const progress = age / bullet.duration;
-      const position = new THREE.Vector3().lerpVectors(bullet.startPos, bullet.endPos, progress);
-      bullet.projectile.position.copy(position);
+      continue;
+    }
 
-      if (now - bullet.lastTrailTime > 10 && bullet.trail.length < 10) {
-        const prev = bullet.trail.length > 0
-          ? (bullet.trail[bullet.trail.length - 1].geometry as THREE.BufferGeometry).attributes.position.array.slice(3, 6)
-          : [bullet.startPos.x, bullet.startPos.y, bullet.startPos.z];
+    const progress = age / bullet.duration;
+    bulletPositionScratch.lerpVectors(bullet.visual.startPos, bullet.visual.endPos, progress);
+    bullet.visual.projectile.position.copy(bulletPositionScratch);
+    (bullet.visual.projectile.material as THREE.MeshBasicMaterial).opacity = 1 - progress * 0.5;
 
-        const trailGeometry = new THREE.BufferGeometry().setFromPoints([
-          new THREE.Vector3(prev[0], prev[1], prev[2]),
-          position.clone()
-        ]);
-        const trailMaterial = new THREE.LineBasicMaterial({
-          color: 0xffaa00,
-          transparent: true,
-          opacity: 0.6,
-          linewidth: 2
-        });
-        const trailSegment = new THREE.Line(trailGeometry, trailMaterial);
-        scene.add(trailSegment);
-        bullet.trail.push(trailSegment);
-        bullet.lastTrailTime = now;
+    updateLine(bullet.visual.line, bullet.visual.startPos, bullet.visual.endPos);
+    if (now - bullet.lastTrailTime > 24 && bullet.visual.trail.length < 10) {
+      const segment = trailSegmentPool.acquire();
+      segment.visible = true;
+      if (!segment.parent) {
+        scene.add(segment);
       }
+      const lastSegment = bullet.visual.trail[bullet.visual.trail.length - 1];
+      const startVec =
+        lastSegment && (lastSegment.userData as { end?: THREE.Vector3 }).end instanceof THREE.Vector3
+          ? ((lastSegment.userData as { end?: THREE.Vector3 }).end as THREE.Vector3)
+          : bullet.visual.startPos;
+      updateLine(segment, startVec, bulletPositionScratch);
+      (segment.userData as { spawnTime?: number }).spawnTime = now;
+      bullet.visual.trail.push(segment);
+      bullet.lastTrailTime = now;
+    }
 
-      bullet.trail.forEach((segment, idx) => {
-        const opacity = Math.max(0, 0.6 - (bullet.trail.length - idx) * 0.1);
-        (segment.material as THREE.LineBasicMaterial).opacity = opacity;
-      });
-
-      (bullet.projectile.material as THREE.MeshBasicMaterial).opacity = 1 - progress * 0.5;
+    for (let j = bullet.visual.trail.length - 1; j >= 0; j--) {
+      const segment = bullet.visual.trail[j];
+      const spawnTime = ((segment.userData as { spawnTime?: number }).spawnTime ?? now);
+      const lifeMs = 180;
+      const alpha = 1 - (now - spawnTime) / lifeMs;
+      if (alpha <= 0) {
+        bullet.visual.trail.splice(j, 1);
+        trailSegmentPool.release(segment);
+        continue;
+      }
+      (segment.material as THREE.LineBasicMaterial).opacity = 0.6 * alpha;
     }
   }
+}
 
-  // NEW: update tracer streak fading & recycle
+function fadeActiveTracers(now: number) {
   for (let i = activeTracers.length - 1; i >= 0; i--) {
-    const t = activeTracers[i];
-    const life = now - t.start;
-    const pct = life / t.lifetime;
+    const entry = activeTracers[i];
+    const pct = (now - entry.start) / entry.lifetime;
     if (pct >= 1) {
-      scene.remove(t.mesh);
-      freeTracer(t.mesh);
+      if (entry.mesh.parent) {
+        entry.mesh.parent.remove(entry.mesh);
+      }
+      freeTracer(entry.mesh);
       activeTracers.splice(i, 1);
     } else {
-      (t.mesh.material as THREE.MeshBasicMaterial).opacity = 0.9 * (1 - pct);
+      (entry.mesh.material as THREE.MeshBasicMaterial).opacity = 0.9 * (1 - pct);
     }
   }
+}
 
-  // Fade out muzzle flashes quickly
+function stepImpactParticles(now: number) {
+  const MAX_LIFETIME = 750;
+  for (let i = impactParticles.length - 1; i >= 0; i--) {
+    const particle = impactParticles[i];
+    const deltaSeconds = Math.min(0.05, Math.max(0, (now - particle.lastUpdate) / 1000));
+    particle.lastUpdate = now;
+
+    const geometry = particle.system.geometry as THREE.BufferGeometry;
+    const positions = geometry.getAttribute('position') as THREE.BufferAttribute;
+    const velocities = particle.velocities;
+
+    for (let j = 0; j < positions.count; j++) {
+      const idx = j * 3;
+      velocities[idx + 1] -= 9.8 * deltaSeconds * 0.6;
+      positions.setX(j, positions.getX(j) + velocities[idx] * deltaSeconds);
+      positions.setY(j, positions.getY(j) + velocities[idx + 1] * deltaSeconds);
+      positions.setZ(j, positions.getZ(j) + velocities[idx + 2] * deltaSeconds);
+    }
+
+    positions.needsUpdate = true;
+
+    const material = particle.system.material as THREE.PointsMaterial;
+    const age = now - particle.startTime;
+    const fade = Math.max(0, 1 - age / MAX_LIFETIME);
+    material.opacity = fade;
+
+    if (age >= MAX_LIFETIME) {
+      releaseImpactParticle(particle);
+      impactParticles.splice(i, 1);
+    }
+  }
+}
+
+function fadeMuzzleFlashes(now: number) {
+  const life = 120;
   for (let i = muzzleFlashes.length - 1; i >= 0; i--) {
     const entry = muzzleFlashes[i];
     const elapsed = now - entry.startTime;
-    const life = 120; // ms
-    const sprite = entry.mesh;
+    const sprite = entry.sprite;
     const material = sprite.material as THREE.SpriteMaterial;
+
     if (elapsed >= life) {
-      scene.remove(sprite);
-      if (material.map) material.map.dispose();
-      material.dispose();
+      muzzleSpritePool.release(sprite);
       muzzleFlashes.splice(i, 1);
-    } else {
-      const alpha = 1 - elapsed / life;
-      material.opacity = alpha;
-      const scale = sprite.scale.x;
-      sprite.scale.set(scale * (0.98), scale * (0.98), 1);
+      continue;
+    }
+
+    const alpha = 1 - elapsed / life;
+    material.opacity = alpha;
+    const scale = entry.baseScale * (0.6 + alpha * 0.4);
+    sprite.scale.set(scale, scale, 1);
+  }
+}
+
+function stepMuzzleLights(now: number) {
+  for (let i = activeMuzzleLights.length - 1; i >= 0; i--) {
+    const entry = activeMuzzleLights[i];
+    const elapsed = now - entry.startTime;
+    if (elapsed >= entry.duration) {
+      muzzleLightPool.release(entry.light);
+      activeMuzzleLights.splice(i, 1);
+      continue;
+    }
+    const factor = Math.max(0, 1 - elapsed / entry.duration);
+    entry.light.intensity = entry.baseIntensity * factor;
+  }
+}
+
+function fadeSplatters(now: number) {
+  const fadeTail = 800;
+  for (let i = activeSplatters.length - 1; i >= 0; i--) {
+    const entry = activeSplatters[i];
+    const elapsed = now - entry.startTime;
+    const mesh = entry.instance.mesh;
+    const material = mesh.material as THREE.MeshBasicMaterial;
+
+    if (elapsed >= entry.lifetime) {
+      const tail = elapsed - entry.lifetime;
+      const alpha = Math.max(0, 1 - tail / fadeTail);
+      material.opacity = 0.7 * alpha;
+      if (alpha <= 0) {
+        releaseSplatter(entry.instance);
+        activeSplatters.splice(i, 1);
+        continue;
+      }
     }
   }
+}
 
-  // Throttled enemy outline targeting
-  if (outlinePass) {
-    outlineThrottle = (outlineThrottle + 1) % 3; // every 3rd frame
-    if (outlineThrottle === 0) {
-      const raycaster = new THREE.Raycaster();
-      if (isPointerLocked) {
-        raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-      } else {
-        raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
-      }
-      const mobObjects = Array.from(mobs.values());
-      const intersects = raycaster.intersectObjects(mobObjects, true);
-      const outlineSet = new Set<THREE.Object3D>();
-      const candidates: Array<{ obj: THREE.Object3D; distance: number }> = [];
-      const pushCandidate = (obj: THREE.Object3D | null | undefined, distance: number) => {
-        if (!obj) return;
-        let root: THREE.Object3D | null = obj;
-        while (root && !root.userData?.isMobRoot && root.parent) {
-          root = root.parent as THREE.Object3D;
-        }
-        if (!root) root = obj;
-        if (outlineSet.has(root)) return;
-        outlineSet.add(root);
-        candidates.push({ obj: root, distance });
-      };
+function updateEnemyOutlines() {
+  if (!outlinePass) return;
+  outlineThrottle = (outlineThrottle + 1) % 3;
+  if (outlineThrottle !== 0) return;
 
-      const forwardDir = outlineScratch.forward.set(0, 0, -1).applyQuaternion(camera.quaternion);
-      forwardDir.y = 0;
-      if (forwardDir.lengthSq() < 1e-4) {
-        forwardDir.set(0, 0, -1);
-      }
-      forwardDir.normalize();
-
-      const toMob = outlineScratch.toMob;
-      mobObjects.forEach(mobObj => {
-        toMob.copy(mobObj.position).sub(camera.position);
-        const distance = toMob.length();
-        if (distance < 0.5 || distance > 42) return;
-        toMob.normalize();
-        const facing = toMob.dot(forwardDir);
-        if (facing > -0.25) {
-          pushCandidate(mobObj, distance);
-        }
-      });
-
-      if (intersects.length > 0) {
-        const primary = intersects[0];
-        pushCandidate(primary.object, primary.distance ?? 0);
-      }
-
-      candidates.sort((a, b) => a.distance - b.distance);
-      const MAX_OUTLINED = 6;
-      outlinePass.selectedObjects = candidates.slice(0, MAX_OUTLINED).map(entry => entry.obj);
-    }
+  const raycaster = new THREE.Raycaster();
+  if (isPointerLocked) {
+    raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  } else {
+    raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), camera);
   }
+  const mobObjects = Array.from(mobs.values());
+  const intersects = raycaster.intersectObjects(mobObjects, true);
+  const outlineSet = new Set<THREE.Object3D>();
+  const candidates: Array<{ obj: THREE.Object3D; distance: number }> = [];
+  const pushCandidate = (obj: THREE.Object3D | null | undefined, distance: number) => {
+    if (!obj) return;
+    let root: THREE.Object3D | null = obj;
+    while (root && !root.userData?.isMobRoot && root.parent) {
+      root = root.parent as THREE.Object3D;
+    }
+    if (!root) root = obj;
+    if (outlineSet.has(root)) return;
+    outlineSet.add(root);
+    candidates.push({ obj: root, distance });
+  };
+
+  const forwardDir = outlineScratch.forward.set(0, 0, -1).applyQuaternion(camera.quaternion);
+  forwardDir.y = 0;
+  if (forwardDir.lengthSq() < 1e-4) {
+    forwardDir.set(0, 0, -1);
+  }
+  forwardDir.normalize();
+
+  const toMob = outlineScratch.toMob;
+  mobObjects.forEach((mobObj) => {
+    toMob.copy(mobObj.position).sub(camera.position);
+    const distance = toMob.length();
+    if (distance < 0.5 || distance > 42) return;
+    toMob.normalize();
+    const facing = toMob.dot(forwardDir);
+    if (facing > -0.25) {
+      pushCandidate(mobObj, distance);
+    }
+  });
+
+  if (intersects.length > 0) {
+    const primary = intersects[0];
+    pushCandidate(primary.object, primary.distance ?? 0);
+  }
+
+  candidates.sort((a, b) => a.distance - b.distance);
+  const MAX_OUTLINED = 6;
+  outlinePass.selectedObjects = candidates.slice(0, MAX_OUTLINED).map((entry) => entry.obj);
+}
+
+function updateCombatAudio(now: number) {
+  if (!me || !myPlayer) return;
+  let enemiesNearby = 0;
+  const playerPos = me.position;
+
+  players.forEach((playerObj, playerId) => {
+    if (playerId !== pid) {
+      const distance = playerObj.position.distanceTo(playerPos);
+      if (distance < 30) {
+        enemiesNearby++;
+      }
+    }
+  });
+
+  mobs.forEach((mobObj) => {
+    const distance = mobObj.position.distanceTo(playerPos);
+    if (distance < 30) {
+      enemiesNearby++;
+    }
+  });
+
+  const takingDamage = lastDamageTime > 0 && now - lastDamageTime < 3000;
+  audioManager.updateCombatIntensity(enemiesNearby, takingDamage);
+}
+
+const renderStep = (_alpha: number, deltaMs: number) => {
+  const now = frameNow;
+  updateDayNight(deltaMs);
+  terrainProbe.set(localPosition.x, localPosition.y, localPosition.z);
+  updateTerrainAround(terrainProbe);
+
+  updatePerformanceBudget(deltaMs);
+  updateRemoteEntities(now);
+  updateCamera();
+  updateUI();
+  updateSpectatorUI();
+  animateLoot(now);
+  stepBulletInstances(now);
+  stepImpactParticles(now);
+  fadeActiveTracers(now);
+  fadeMuzzleFlashes(now);
+  stepMuzzleLights(now);
+  fadeSplatters(now);
+  updateEnemyOutlines();
 
   if (composer) {
     composer.render();
@@ -3204,126 +3601,97 @@ function animate() {
     renderer.render(scene, camera);
   }
 
-  // Update audio listener position with camera
-  const forward = new THREE.Vector3();
-  camera.getWorldDirection(forward);
-  audioManager.updateListener(camera.position, forward);
+  camera.getWorldDirection(audioForwardScratch);
+  audioManager.updateListener(camera.position, audioForwardScratch);
+  updateCombatAudio(now);
+};
 
-  // Update combat intensity for dynamic music
-  if (me && myPlayer) {
-    let enemiesNearby = 0;
-    const playerPos = me.position;
+const gameLoop = new GameLoop(physicsStep, renderStep, 60, 100);
 
-    // Count nearby enemy players (other players within 30 units)
-    players.forEach((playerObj, playerId) => {
-      if (playerId !== pid) {
-        const distance = playerObj.position.distanceTo(playerPos);
-        if (distance < 30) {
-          enemiesNearby++;
-        }
-      }
-    });
+function startGameLoop() {
+  const bootstrap = performance.now();
+  frameNow = bootstrap;
+  gameLoop.reset(bootstrap);
 
-    // Count nearby mobs (AI enemies within 30 units)
-    mobs.forEach((mobObj) => {
-      const distance = mobObj.position.distanceTo(playerPos);
-      if (distance < 30) {
-        enemiesNearby++;
-      }
-    });
+  const frame = (timestamp: number) => {
+    frameNow = timestamp;
+    gameLoop.tick(timestamp);
+    requestAnimationFrame(frame);
+  };
 
-    // Check if taking damage (recent damage indicator)
-    const takingDamage = lastDamageTime > 0 && (performance.now() - lastDamageTime < 3000);
-
-    // Update combat intensity for dynamic music
-    audioManager.updateCombatIntensity(enemiesNearby, takingDamage);
-  }
-
-  requestAnimationFrame(animate);
+  requestAnimationFrame(frame);
 }
 
-// New bullet visual that guarantees visible tracer + keeps your projectile sprite + muzzle flash
+function releaseBullet(instance: BulletInstance) {
+  const { visual } = instance;
+  visual.trail.forEach(segment => {
+    trailSegmentPool.release(segment);
+  });
+  visual.trail.length = 0;
+  if (visual.projectile.parent) visual.projectile.parent.remove(visual.projectile);
+  if (visual.line.parent) visual.line.parent.remove(visual.line);
+  const tracerIdx = activeTracers.findIndex(entry => entry.mesh === visual.tracer);
+  if (tracerIdx !== -1) {
+    activeTracers.splice(tracerIdx, 1);
+  }
+  bulletPool.release(visual);
+}
+
 function createBulletVisual(start: THREE.Vector3, direction: THREE.Vector3, hit: boolean) {
   const weaponRange = myPlayer?.equipped?.range ?? 35;
   const maxDistance = Math.max(25, Math.min(weaponRange, 120));
   const distance = hit ? Math.min(maxDistance, weaponRange) : maxDistance;
-  const end = new THREE.Vector3().copy(start).addScaledVector(direction, distance);
 
-  // Projectile (small glowing sphere)
-  const projectileGeometry = new THREE.SphereGeometry(0.12, 8, 6);
-  const projectileMaterial = new THREE.MeshBasicMaterial({
-    color: 0xffff00,
-    transparent: true,
-    opacity: 1
-  });
-  const projectile = new THREE.Mesh(projectileGeometry, projectileMaterial);
-  projectile.position.copy(start);
-  scene.add(projectile);
+  const visual = bulletPool.acquire();
+  visual.startPos.copy(start);
+  visual.endPos.copy(start).addScaledVector(direction, distance);
+  visual.trail.length = 0;
 
-  // Tracer streak
-  const tracer = allocTracer();
-  const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
-  const dir = new THREE.Vector3().subVectors(end, start);
-  const len = Math.max(0.001, dir.length());
-  tracer.position.copy(mid);
-  tracer.scale.set(1, len, 1);
-  tracer.lookAt(end);
-  tracer.rotateX(Math.PI / 2);
-  scene.add(tracer);
-  activeTracers.push({ mesh: tracer, start: performance.now(), lifetime: PHYSICS_TUNING.PROJECTILE_LIFETIME * 1000 });
+  visual.projectile.visible = true;
+  visual.projectile.position.copy(start);
+  (visual.projectile.material as THREE.MeshBasicMaterial).opacity = 1;
+  scene.add(visual.projectile);
 
-  // Glowing line overlay
-  const lineGeometry = new THREE.BufferGeometry().setFromPoints([start, end]);
-  const lineMaterial = new THREE.LineBasicMaterial({
-    color: 0xffff00,
-    linewidth: 3,
-    transparent: true,
-    opacity: 0.8,
-    blending: THREE.AdditiveBlending
-  });
-  const line = new THREE.Line(lineGeometry, lineMaterial);
-  scene.add(line);
-  setTimeout(() => {
-    scene.remove(line);
-    lineGeometry.dispose();
-    lineMaterial.dispose();
-  }, 250);
+  visual.tracer.visible = true;
+  visual.tracer.rotation.set(0, 0, 0);
+  bulletMidScratch.copy(visual.startPos).add(visual.endPos).multiplyScalar(0.5);
+  tracerDirScratch.copy(visual.endPos).sub(visual.startPos);
+  const len = Math.max(0.001, tracerDirScratch.length());
+  visual.tracer.position.copy(bulletMidScratch);
+  visual.tracer.scale.set(1, len, 1);
+  visual.tracer.lookAt(visual.endPos);
+  visual.tracer.rotateX(Math.PI / 2);
+  scene.add(visual.tracer);
 
-  // Muzzle flash and projectile tween (unchanged core)
-  createMuzzleFlash([start.x, start.y, start.z]);
+  activeTracers.push({ mesh: visual.tracer, start: performance.now(), lifetime: PHYSICS_TUNING.PROJECTILE_LIFETIME * 1000 });
 
-  const projectileEntry = {
-    projectile,
-    trail: [] as THREE.Line[],
-    startTime: Date.now(),
+  visual.line.visible = true;
+  updateLine(visual.line, visual.startPos, visual.endPos);
+  if (!visual.line.parent) scene.add(visual.line);
+
+  const nowMs = Date.now();
+  activeBullets.push({
+    visual,
+    startTime: nowMs,
     duration: PHYSICS_TUNING.PROJECTILE_LIFETIME * 1000,
-    startPos: start.clone(),
-    endPos: end.clone(),
-    lastTrailTime: Date.now()
-  };
-  activeBullets.push(projectileEntry);
+    lastTrailTime: nowMs
+  });
 
   while (activeBullets.length > 20) {
-    const old = activeBullets.shift();
-    if (!old) break;
-    scene.remove(old.projectile);
-    old.projectile.geometry.dispose();
-    (old.projectile.material as THREE.Material).dispose();
-    old.trail.forEach(seg => {
-      scene.remove(seg);
-      seg.geometry.dispose();
-      (seg.material as THREE.Material).dispose();
-    });
+    const stale = activeBullets.shift();
+    if (stale) {
+      releaseBullet(stale);
+    }
   }
 
   while (activeTracers.length > 30) {
-    const t = activeTracers.shift();
-    if (!t) break;
-    scene.remove(t.mesh);
-    freeTracer(t.mesh);
+    const staleTracer = activeTracers.shift();
+    if (staleTracer) {
+      freeTracer(staleTracer.mesh);
+    }
   }
 
-  // Add micro recoil
+  createMuzzleFlash([start.x, start.y, start.z]);
   recoilKick += isADS ? 0.004 : 0.008;
 }
 
@@ -3371,13 +3739,13 @@ preloadEnemyModels().then(() => {
 
   // Start game after models are loaded
   connect();
-  animate();
+  startGameLoop();
 }).catch((error) => {
   console.warn('Failed to preload some enemy models:', error);
 
   // Start game anyway with procedural geometry
   connect();
-  animate();
+  startGameLoop();
 });
 
 // Cross-browser fullscreen helpers

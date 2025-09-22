@@ -1,21 +1,22 @@
 import { Env } from './index';
 import { rollGun, Gun } from './loot';
 import { createTerrainHeightMap } from './terrain';
-import { ENEMY_TYPES, EnemyTypeId, WORLD_SCALE } from '../../shared/gameConfig';
+import { ENEMY_TYPES, EnemyTypeId, WORLD_SCALE, PHYSICS_TUNING } from '../../shared/gameConfig';
+import { GameLoop } from '../../shared/GameLoop';
 
 const MOVE = {
-  maxSpeed: 6,
-  accel: 28,
-  friction: 10,
-  airControl: 0.3,
+  maxSpeed: PHYSICS_TUNING.PLAYER_MAX_SPEED,
+  accel: PHYSICS_TUNING.PLAYER_ACCELERATION,
+  decel: PHYSICS_TUNING.PLAYER_DECELERATION,
+  airControl: 0.35,
   sprintMultiplier: 1.5
 };
 
 const PHYSICS = {
-  gravity: 25,
-  jumpPower: 10,
-  terminalVelocity: 50,
-  airResistance: 0.02
+  gravity: Math.abs(PHYSICS_TUNING.GRAVITY),
+  jumpPower: PHYSICS_TUNING.PLAYER_JUMP_FORCE,
+  terminalVelocity: 55,
+  airResistance: 0.018
 };
 
 const JUMP = {
@@ -73,17 +74,20 @@ export class Room {
   private mobs = new Map<string, Mob>();
   private loot = new Map<string, LootDrop>();
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private gameLoop: GameLoop | null = null;
   private tickMs: number;
+  private updatesPerSecond: number;
   private tickCounter = 0;
   private roomSeed: string;
   private terrain = createTerrainHeightMap(WORLD_SIZE, WORLD_SIZE, 1337);
-  private lastTickTime = Date.now();
   private difficulty: Difficulty = 'normal';
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
-    this.tickMs = Math.max(10, Math.floor(1000 / Number(env.TICK_HZ || 20)));
+    const hz = Math.max(20, Number(env.TICK_HZ || 60));
+    this.updatesPerSecond = hz;
+    this.tickMs = Math.max(10, Math.floor(1000 / hz));
     this.roomSeed = crypto.randomUUID();
   }
 
@@ -796,9 +800,9 @@ export class Room {
       player.vz += (targetVz - player.vz) * Math.min(1, MOVE.accel * dt * control);
 
       if (onGround && desiredLen < 0.01) {
-        const frictionFactor = 1 / (1 + MOVE.friction * dt);
-        player.vx *= frictionFactor;
-        player.vz *= frictionFactor;
+        const damping = 1 / (1 + MOVE.decel * dt);
+        player.vx *= damping;
+        player.vz *= damping;
       }
 
       if (!onGround) {
@@ -1152,8 +1156,23 @@ export class Room {
   }
 
   private startTick() {
-    this.lastTickTime = Date.now();
-    this.tickTimer = setInterval(() => this.tick(), this.tickMs);
+    if (!this.gameLoop) {
+      this.gameLoop = new GameLoop(
+        (deltaMs) => this.stepSimulation(deltaMs),
+        () => {},
+        this.updatesPerSecond,
+        100
+      );
+      this.gameLoop.reset(Date.now());
+    }
+
+    if (this.tickTimer) {
+      return;
+    }
+
+    this.tickTimer = setInterval(() => {
+      this.gameLoop?.tick(Date.now());
+    }, this.tickMs);
   }
 
   private stopTick() {
@@ -1161,30 +1180,28 @@ export class Room {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
     }
+
+    if (this.sockets.size === 0) {
+      this.gameLoop = null;
+    }
   }
 
-  private tick() {
+  private stepSimulation(deltaMs: number) {
     this.tickCounter++;
 
-    // Spawn mobs periodically
     const difficultyConfig = this.getDifficultyConfig();
     if (this.tickCounter % difficultyConfig.spawnInterval === 0 && this.mobs.size < difficultyConfig.maxMobs) {
       this.spawnMob();
     }
 
-    const now = Date.now();
-    const dtMs = Math.min(200, now - this.lastTickTime);
-    this.lastTickTime = now;
-    const dtSeconds = Math.max(0.001, dtMs / 1000);
-    const subSteps = Math.max(1, Math.round(dtSeconds / FIXED_TICK));
-    const stepDt = dtSeconds / subSteps;
+    const dtSeconds = Math.max(0.001, deltaMs / 1000);
+    this.updatePlayers(dtSeconds);
+    this.updateMobs(dtSeconds);
 
-    for (let i = 0; i < subSteps; i++) {
-      this.updatePlayers(stepDt);
-      this.updateMobs(stepDt);
-    }
+    this.broadcastState();
+  }
 
-    // Send snapshot to all clients
+  private broadcastState() {
     const snapshot = {
       type: "snapshot",
       t: Date.now(),

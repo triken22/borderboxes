@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
-import { ColladaLoader } from 'three/examples/jsm/loaders/ColladaLoader.js';
+import { ColladaLoader, Collada } from 'three/examples/jsm/loaders/ColladaLoader.js';
 import { MTLLoader } from 'three/examples/jsm/loaders/MTLLoader.js';
 
 function materialHasTexture(material: THREE.Material): material is THREE.Material & { map: THREE.Texture | null } {
@@ -177,7 +177,7 @@ export class VoxelModelLoader {
     return new Promise((resolve, reject) => {
       this.colladaLoader.load(
         path,
-        (collada: ColladaLoader.Collada) => {
+        (collada: Collada) => {
           const group = new THREE.Group();
           group.add(collada.scene);
           group.scale.setScalar(scale);

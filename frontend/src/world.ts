@@ -1,5 +1,6 @@
 // client/world.ts
 import * as THREE from 'three';
+import { resourceManager } from './resourceManager';
 
 // Global terrain height map for collision detection
 export const terrainHeightMap = new Map<string, number>();
@@ -16,7 +17,6 @@ export interface TerrainSample {
 }
 
 
-const WATER_LEVEL = 2;
 let currentTerrainSeed = 1337;
 let currentTerrainDimensions = { width: 64, depth: 64 };
 
@@ -66,6 +66,11 @@ interface TerrainChunkRecord {
   cz: number;
   group: THREE.Group;
   obstacleKeys: string[];
+  resources: {
+    geometries: THREE.BufferGeometry[];
+    materials: THREE.Material[];
+    textures: THREE.Texture[];
+  };
 }
 
 class TerrainManager {
@@ -89,6 +94,7 @@ class TerrainManager {
     if (targetScene) {
       for (const chunk of this.chunks.values()) {
         targetScene.remove(chunk.group);
+        disposeChunkResources(chunk);
       }
     }
     this.chunks.clear();
@@ -112,6 +118,7 @@ class TerrainManager {
         for (const obstacleKey of chunk.obstacleKeys) {
           obstacles.delete(obstacleKey);
         }
+        disposeChunkResources(chunk);
         this.chunks.delete(key);
       }
     }
@@ -162,7 +169,14 @@ class TerrainManager {
     const originX = cx * CHUNK_SIZE;
     const originZ = cz * CHUNK_SIZE;
 
-    const plane = new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE);
+    const resources = {
+      geometries: [] as THREE.BufferGeometry[],
+      materials: [] as THREE.Material[],
+      textures: [] as THREE.Texture[]
+    };
+
+    const plane = resourceManager.trackGeometry(new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE));
+    resources.geometries.push(plane);
     const positions = plane.attributes.position as THREE.BufferAttribute;
 
     for (let i = 0; i < positions.count; i++) {
@@ -176,11 +190,12 @@ class TerrainManager {
 
     plane.computeVertexNormals();
 
-    const groundMaterial = new THREE.MeshStandardMaterial({
+    const groundMaterial = resourceManager.trackMaterial(new THREE.MeshStandardMaterial({
       color: 0x2f2f35,
       roughness: 0.92,
       metalness: 0.08
-    });
+    }));
+    resources.materials.push(groundMaterial);
 
     const groundMesh = new THREE.Mesh(plane, groundMaterial);
     groundMesh.rotation.x = -Math.PI / 2;
@@ -200,14 +215,15 @@ class TerrainManager {
       const worldZ = originZ + rng() * CHUNK_SIZE;
       const baseHeight = this.sampleHeightSmooth(worldX, worldZ);
 
-      const structure = new THREE.Mesh(
-        new THREE.BoxGeometry(width, height, depth),
-        new THREE.MeshStandardMaterial({
-          color: 0x3a3f4b,
-          roughness: 0.6,
-          metalness: 0.25
-        })
-      );
+      const structureGeometry = resourceManager.trackGeometry(new THREE.BoxGeometry(width, height, depth));
+      resources.geometries.push(structureGeometry);
+      const structureMaterial = resourceManager.trackMaterial(new THREE.MeshStandardMaterial({
+        color: 0x3a3f4b,
+        roughness: 0.6,
+        metalness: 0.25
+      }));
+      resources.materials.push(structureMaterial);
+      const structure = new THREE.Mesh(structureGeometry, structureMaterial);
       structure.position.set(worldX, baseHeight + height / 2, worldZ);
       structure.castShadow = true;
       structure.receiveShadow = true;
@@ -226,16 +242,17 @@ class TerrainManager {
       const worldZ = originZ + rng() * CHUNK_SIZE;
       const baseHeight = this.sampleHeightSmooth(worldX, worldZ);
 
-      const pad = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.4, 0.4, 0.3, 16),
-        new THREE.MeshStandardMaterial({
-          color: 0x343b64,
-          emissive: 0x2f4adb,
-          emissiveIntensity: 0.5,
-          roughness: 0.4,
-          metalness: 0.2
-        })
-      );
+      const padGeometry = resourceManager.trackGeometry(new THREE.CylinderGeometry(0.4, 0.4, 0.3, 16));
+      resources.geometries.push(padGeometry);
+      const padMaterial = resourceManager.trackMaterial(new THREE.MeshStandardMaterial({
+        color: 0x343b64,
+        emissive: 0x2f4adb,
+        emissiveIntensity: 0.5,
+        roughness: 0.4,
+        metalness: 0.2
+      }));
+      resources.materials.push(padMaterial);
+      const pad = new THREE.Mesh(padGeometry, padMaterial);
       pad.position.set(worldX, baseHeight + 0.15, worldZ);
       pad.castShadow = false;
       pad.receiveShadow = true;
@@ -247,9 +264,31 @@ class TerrainManager {
       cx,
       cz,
       group: chunkGroup,
-      obstacleKeys
+      obstacleKeys,
+      resources
     };
   }
+}
+
+function disposeChunkResources(chunk: TerrainChunkRecord) {
+  for (const geometry of chunk.resources.geometries) {
+    resourceManager.untrackGeometry(geometry);
+    geometry.dispose();
+  }
+  for (const material of chunk.resources.materials) {
+    if ('map' in material && material.map) {
+      const map = material.map;
+      if (map instanceof THREE.Texture) {
+        resourceManager.untrackTexture(map);
+        map.dispose();
+      }
+    }
+    resourceManager.untrackMaterial(material);
+    material.dispose();
+  }
+  chunk.resources.geometries.length = 0;
+  chunk.resources.materials.length = 0;
+  chunk.resources.textures.length = 0;
 }
 
 const terrainManager = new TerrainManager();
